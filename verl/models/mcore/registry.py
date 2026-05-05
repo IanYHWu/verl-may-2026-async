@@ -31,7 +31,11 @@ class SupportedVLM(Enum):
     QWEN3_MOE_VL = "Qwen3VLMoeForConditionalGeneration"
     QWEN3_VL = "Qwen3VLForConditionalGeneration"
     QWEN3_5_MOE_VL = "Qwen3_5MoeForConditionalGeneration"
-    QWEN3_5_VL = "Qwen3_5ForConditionalGeneration"
+    # NOTE: Qwen3.5 dense (Qwen3_5ForConditionalGeneration) is deliberately NOT
+    # added to SupportedVLM. For text-only RL we route it through
+    # model_forward_gen(False) (non-VL forward) so the training-side forward
+    # can take BSHD. The VL forward would force THD packing, which the
+    # GatedDeltaNet layers in the hybrid attention pattern reject.
 
 
 supported_vlm = [member.value for member in SupportedVLM]

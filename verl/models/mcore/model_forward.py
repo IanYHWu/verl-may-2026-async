@@ -147,9 +147,17 @@ def model_forward_gen(vision_model: bool = False):
                 sequence_parallel=sp,
                 pre_process=pre_process_for_bshd,
             )
+            # MRoPE fix for Qwen3.5 (text-only routing): when the model uses
+            # MRoPE (`mrope_section` set on its config), it auto-computes the
+            # 3-D position ids via `get_rope_index`. Verl's 1-D position_ids
+            # would otherwise trip `mbridge/models/qwen3_vl/rope_utils.py`
+            # with `IndexError: too many indices for tensor of dimension 2`.
+            uses_mrope = (
+                getattr(unwrap_model(model).config, "mrope_section", None) is not None
+            )
             output_orig = model(
                 input_ids=new_input_ids,
-                position_ids=None if vision_model else new_position_ids,
+                position_ids=None if (vision_model or uses_mrope) else new_position_ids,
                 attention_mask=new_attention_mask,
                 **model_kwargs,
             )
@@ -355,10 +363,15 @@ def gptmodel_forward_model_engine(
         else:
             attention_mask = attention_mask_bshd
 
+        # MRoPE fix (see model_forward_gen BSHD branch): force position_ids=None
+        # when the model uses MRoPE so it auto-computes 3-D position ids.
+        uses_mrope = (
+            getattr(unwrap_model(model).config, "mrope_section", None) is not None
+        )
         output_orig = model(
             input_ids=input_ids_bshd,
             attention_mask=attention_mask,
-            position_ids=None if vision_model else position_ids_bshd,
+            position_ids=None if (vision_model or uses_mrope) else position_ids_bshd,
             **model_kwargs,
         )
         if post_process and logits_processor is not None:
