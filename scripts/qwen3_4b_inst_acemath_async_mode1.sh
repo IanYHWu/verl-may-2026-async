@@ -78,7 +78,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     data.prompt_key=prompt \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
-    data.filter_overlong_prompts=False \
+    data.filter_overlong_prompts=True \
     data.truncation='left' \
     data.return_raw_chat=True \
     +data.apply_chat_template_kwargs.return_dict=false \
@@ -119,8 +119,9 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.max_model_len=${max_model_len} \
     actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
+    actor_rollout_ref.rollout.prompt_length=${max_prompt_length} \
+    actor_rollout_ref.rollout.response_length=${max_response_length} \
     actor_rollout_ref.rollout.enforce_eager=false \
-    actor_rollout_ref.rollout.cudagraph_mode=FULL_AND_PIECEWISE \
     actor_rollout_ref.rollout.checkpoint_engine.backend=nccl \
     actor_rollout_ref.rollout.enable_chunked_prefill=true \
     actor_rollout_ref.rollout.calculate_log_probs=True \
@@ -157,7 +158,6 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     rollout.n_gpus_per_node=${n_gpus_rollout} \
     rollout.n=${n_resp_per_prompt} \
     rollout.total_rollout_steps=${total_rollout_steps} \
-    rollout.test_freq=-1 \
     async_training.staleness_threshold=${staleness_threshold} \
     async_training.trigger_parameter_sync_step=${trigger_parameter_sync_step} \
     async_training.require_batches=${require_batches} \

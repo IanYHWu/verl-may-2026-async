@@ -105,7 +105,6 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_model_len=${max_model_len} \
     actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
     actor_rollout_ref.rollout.enforce_eager=false \
-    actor_rollout_ref.rollout.cudagraph_mode=FULL_AND_PIECEWISE \
     actor_rollout_ref.rollout.enable_chunked_prefill=true \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
