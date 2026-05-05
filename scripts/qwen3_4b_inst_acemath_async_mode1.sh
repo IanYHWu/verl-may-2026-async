@@ -62,8 +62,8 @@ max_num_batched_tokens=${max_model_len}
 
 save_freq=${SAVE_FREQ:-50}
 
-PROJECT_NAME=${PROJECT_NAME:-"dapo_qwen3_4b_inst_acemath_async_mode1"}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-"4b_inst_acemath_16k_bsz64_mbsz32_clip028_lr1e6_wd001_mode1_ckptmgr_wired"}
+PROJECT_NAME=${PROJECT_NAME:-"async_verl_debug"}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"qwen3_4b_inst_acemath_mode1_16k_bsz64_mbsz32_clip028_lr1e6_wd001"}
 
 CKPT_DIR=${CKPT_DIR:-"/tmp/ianwu/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}"}
 
