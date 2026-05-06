@@ -535,15 +535,20 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # Reset staleness in rollouter
         timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
+        # Anchor cycle-level logs to the global_step that _fit_postprocess_step is
+        # about to set, so they share the wandb step with the per-step log (which
+        # then takes precedence for any overlapping keys). Avoids wandb step regression
+        # when current_param_version trails global_steps (e.g. trigger_sync_step>1).
+        cycle_log_step = self.global_steps + 1
         self.logger.log(
             data=timing_raw,
-            step=self.current_param_version,
+            step=cycle_log_step,
         )
 
         # Log aggregated training metrics
         self.logger.log(
             data=self.metrics_aggregator.get_aggregated_metrics(),
-            step=self.current_param_version,
+            step=cycle_log_step,
         )
         self.metrics_aggregator.reset()
 
@@ -680,6 +685,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
     def _fit_postprocess_step(self):
         self.global_steps += 1
+
+        # Per-step wandb log: flush self.metrics every step (not just at param sync).
+        # Without this, with trigger_parameter_sync_step>1, only cycle-aggregated values
+        # (avg over the cycle) appear in wandb — masking per-step trajectories.
+        self.logger.log(data=self.metrics, step=self.global_steps)
 
         self.metrics_aggregator.add_step_metrics(
             metrics=self.metrics, sample_count=self.required_samples, timestamp=time.time()
