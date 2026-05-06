@@ -83,6 +83,14 @@ class LLMJudgeRewardManager(RewardManagerBase):
             max_concurrency=int(judge_cfg.get("max_concurrency", 32)),
         )
 
+        # extra_fields: declarative map of "<<template_var>>" -> "dotted.path"
+        # resolved against the data_item's non_tensor_batch. Lets a custom
+        # template reference dataset columns beyond problem/response/rubric
+        # (e.g., a reference solution) without writing a custom manager.
+        self._extra_fields_paths: dict[str, str] = {
+            str(k): str(v) for k, v in dict(judge_cfg.get("extra_fields", {}) or {}).items()
+        }
+
     async def run_single(self, data: DataProto) -> dict[str, Any]:
         assert len(data) == 1, "Only support single data item"
         data_item = data[0]
@@ -106,6 +114,7 @@ class LLMJudgeRewardManager(RewardManagerBase):
         extra_info = data_item.non_tensor_batch.get("extra_info", {}) or {}
 
         cfg = self._judge_cfg
+        template_fields = self._resolve_extra_fields(data_item)
         result = await self.compute_score(
             solution_str=response_str,
             ground_truth=ground_truth,
@@ -120,9 +129,11 @@ class LLMJudgeRewardManager(RewardManagerBase):
             reasoning_effort=cfg.get("reasoning_effort"),
             thinking_mode=cfg.get("thinking_mode"),
             on_error_score=float(cfg.get("on_error_score", 0.0)),
+            strip_thinking=bool(cfg.get("strip_thinking", True)),
             tokenizer=self.tokenizer,
             data_source=data_source,
             extra_info=extra_info,
+            template_fields=template_fields,
         )
 
         score = float(result["score"])
@@ -131,6 +142,28 @@ class LLMJudgeRewardManager(RewardManagerBase):
         reward_extra_info["acc"] = score
 
         return {"reward_score": score, "reward_extra_info": reward_extra_info}
+
+    def _resolve_extra_fields(self, data_item: Any) -> dict[str, Any]:
+        """Resolve configured ``extra_fields`` against ``data_item.non_tensor_batch``.
+
+        Each entry is a dotted path. Missing paths fall back to an empty
+        string with a warning so a malformed dataset row doesn't crash the run.
+        """
+        if not self._extra_fields_paths:
+            return {}
+        resolved: dict[str, Any] = {}
+        for var_name, path in self._extra_fields_paths.items():
+            try:
+                resolved[var_name] = _resolve_dotted(data_item.non_tensor_batch, path)
+            except (KeyError, TypeError, IndexError) as exc:
+                # Don't abort training on a missing field; log and substitute "".
+                resolved[var_name] = ""
+                logger_msg = f"LLMJudge extra_field {var_name!r} (path={path!r}) missing: {exc}"
+                # Use the manager's logger if available; otherwise fall back to print.
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning(logger_msg)
+        return resolved
 
     def _extract_question(self, data_item: Any) -> str:
         """Recover the user-visible question from the data item.
@@ -162,3 +195,18 @@ class LLMJudgeRewardManager(RewardManagerBase):
         prompt_attn = attention_mask[:prompt_length]
         valid_prompt_ids = prompts[prompt_attn.bool()]
         return self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+
+
+def _resolve_dotted(root: Any, path: str) -> Any:
+    """Walk a dotted path through dict-like and list-like structures."""
+    cur = root
+    for key in path.split("."):
+        if isinstance(cur, dict):
+            cur = cur[key]
+        else:
+            # numpy structured access / list indexing
+            if key.isdigit():
+                cur = cur[int(key)]
+            else:
+                cur = cur[key]
+    return cur

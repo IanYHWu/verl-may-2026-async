@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_TEMPLATE = "proof_rubric"
 DEFAULT_MAX_SCORE = 7.0
 DEFAULT_MAX_OUTPUT_TOKENS = 512
+THINK_CLOSE_TAG = "</think>"
 
 
 async def compute_score(
@@ -54,9 +55,11 @@ async def compute_score(
     reasoning_effort: Optional[str] = None,
     thinking_mode: Optional[bool] = None,
     on_error_score: float = 0.0,
+    strip_thinking: bool = True,
     tokenizer: Any = None,
     data_source: Optional[str] = None,
     extra_info: Optional[dict[str, Any]] = None,
+    template_fields: Optional[dict[str, Any]] = None,
     **_: Any,
 ) -> dict[str, Any]:
     """Score a proof solution by asking an LLM judge to walk a rubric.
@@ -81,18 +84,52 @@ async def compute_score(
             ``extra_body.chat_template_kwargs.enable_thinking``.
         on_error_score: returned (normalized) when the call fails or the
             judge output cannot be parsed.
+        strip_thinking: when True (default), look for a final ``</think>`` tag
+            in the response and pass only the post-tag text to the judge. If
+            no ``</think>`` is found, the reward is **forced to**
+            ``on_error_score`` and the judge is **not** called — we fail
+            closed rather than grading the raw chain of thought.
+        template_fields: optional extra ``name -> value`` pairs forwarded to
+            ``render_template``. Use to inject custom sentinels referenced by
+            a custom template (e.g., ``<<reference_solution>>``).
 
     Returns:
         Dict with at least ``score`` (normalized [0, 1]). Extras: ``raw_score``,
-        ``judge_text``, ``judge_latency_s``, ``judge_attempts``, ``judge_error``.
+        ``judge_text``, ``judge_latency_s``, ``judge_attempts``, ``judge_error``,
+        ``had_think_tag``.
     """
-    judge_prompt = render_template(
-        template_name,
-        problem=question,
-        response=solution_str,
-        rubric=ground_truth,
-        max_score=int(max_score) if float(max_score).is_integer() else max_score,
-    )
+    # Strip the thinking section before sending to the judge. We use rfind so
+    # that nested or repeated </think> tags resolve to "everything after the
+    # *last* one" — the model's final emitted answer.
+    had_think_tag: Optional[bool] = None
+    judge_input = solution_str
+    if strip_thinking:
+        idx = solution_str.rfind(THINK_CLOSE_TAG)
+        had_think_tag = idx != -1
+        if not had_think_tag:
+            # Fail closed. No judge call.
+            return {
+                "score": (float(on_error_score) / float(max_score)) if max_score else 0.0,
+                "raw_score": None,
+                "judge_text": "",
+                "judge_latency_s": 0.0,
+                "judge_attempts": 0,
+                "judge_error": "missing_think_tag",
+                "had_think_tag": False,
+            }
+        judge_input = solution_str[idx + len(THINK_CLOSE_TAG):].lstrip()
+
+    fields: dict[str, Any] = {
+        "problem": question,
+        "response": judge_input,
+        "rubric": ground_truth,
+        "max_score": int(max_score) if float(max_score).is_integer() else max_score,
+    }
+    if template_fields:
+        # template_fields may shadow defaults if user wants — explicit > implicit.
+        fields.update(template_fields)
+
+    judge_prompt = render_template(template_name, **fields)
 
     # Optional input-token guard. We truncate the *response* preferentially —
     # the problem and rubric are required for grading; the response is what
@@ -102,10 +139,7 @@ async def compute_score(
         if len(ids) > max_input_tokens:
             judge_prompt = _truncate_response_in_prompt(
                 template_name=template_name,
-                question=question,
-                response=solution_str,
-                rubric=ground_truth,
-                max_score=max_score,
+                fields=fields,
                 tokenizer=tokenizer,
                 budget=max_input_tokens,
             )
@@ -128,6 +162,7 @@ async def compute_score(
             "judge_latency_s": 0.0,
             "judge_attempts": 0,
             "judge_error": str(exc)[:300],
+            "had_think_tag": had_think_tag,
         }
 
     judge_text = result["content"]
@@ -145,6 +180,7 @@ async def compute_score(
             "judge_latency_s": result["latency_s"],
             "judge_attempts": result["attempts"],
             "judge_error": "parse_failure",
+            "had_think_tag": had_think_tag,
         }
 
     clamped = max(0.0, min(float(raw), float(max_score)))
@@ -157,39 +193,32 @@ async def compute_score(
         "judge_latency_s": result["latency_s"],
         "judge_attempts": result["attempts"],
         "judge_error": None,
+        "had_think_tag": had_think_tag,
     }
 
 
 def _truncate_response_in_prompt(
     *,
     template_name: str,
-    question: str,
-    response: str,
-    rubric: str,
-    max_score: float,
+    fields: dict[str, Any],
     tokenizer: Any,
     budget: int,
 ) -> str:
-    """Re-render the prompt with the response truncated to fit the token budget."""
-    # Render with empty response first to measure overhead.
-    overhead = render_template(
-        template_name,
-        problem=question,
-        response="",
-        rubric=rubric,
-        max_score=int(max_score) if float(max_score).is_integer() else max_score,
-    )
+    """Re-render the prompt with the response truncated to fit the token budget.
+
+    Truncates the ``response`` field; problem, rubric, and any user-supplied
+    extra fields are preserved.
+    """
+    overhead_fields = dict(fields)
+    overhead_fields["response"] = ""
+    overhead = render_template(template_name, **overhead_fields)
     overhead_tokens = len(tokenizer.encode(overhead, add_special_tokens=False))
     response_budget = max(0, budget - overhead_tokens - 32)  # keep some slack
-    response_ids = tokenizer.encode(response, add_special_tokens=False)
+    response_ids = tokenizer.encode(fields["response"], add_special_tokens=False)
     if len(response_ids) > response_budget:
         response_ids = response_ids[:response_budget]
-        response = tokenizer.decode(response_ids, skip_special_tokens=True)
-        response = response + "\n\n[…response truncated for grader budget…]"
-    return render_template(
-        template_name,
-        problem=question,
-        response=response,
-        rubric=rubric,
-        max_score=int(max_score) if float(max_score).is_integer() else max_score,
-    )
+        truncated = tokenizer.decode(response_ids, skip_special_tokens=True)
+        truncated = truncated + "\n\n[…response truncated for grader budget…]"
+        fields = dict(fields)
+        fields["response"] = truncated
+    return render_template(template_name, **fields)
