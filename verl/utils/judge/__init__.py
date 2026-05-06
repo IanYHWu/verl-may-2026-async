@@ -16,6 +16,13 @@
 
 from .client import JudgeClient
 from .parser import parse_score
+from .paths import resolve_dotted
 from .prompt import load_template, render_template
 
-__all__ = ["JudgeClient", "parse_score", "load_template", "render_template"]
+__all__ = [
+    "JudgeClient",
+    "parse_score",
+    "load_template",
+    "render_template",
+    "resolve_dotted",
+]

@@ -27,6 +27,105 @@ The trainer flow is unchanged — the manager returns the standard
 `{"reward_score": float, "reward_extra_info": {...}}` shape, and reward dispatches
 through the same `RewardLoopWorker.compute_score_batch`.
 
+## Dataset format
+
+The judge reads each row through the same DAPO chat schema that the
+rule-based managers use, so the same parquets work for both modes. The
+rubric goes in `reward_model.ground_truth`; arbitrary extra columns can be
+referenced from a custom template via `extra_fields` (see below).
+
+### Required columns
+
+| Column | Type | Description |
+|---|---|---|
+| `prompt` | `list<struct{role: string, content: string}>` | Chat-format messages. The judge extracts the question from this — preferring the first `user` turn. Must contain at least one message. |
+| `data_source` | `string` | Free-form tag preserved through to wandb (e.g., `aops`, `olympiads`). Not used to dispatch behavior in the LLM-judge path. |
+| `reward_model` | `struct{ground_truth: string, ...}` | Must contain `ground_truth` (the rubric text). Additional fields like `style` or `reference_solution` are allowed. |
+
+### Recommended columns
+
+| Column | Type | Description |
+|---|---|---|
+| `ability` | `string` | Task tag (e.g., `math_proof`). Not required, but downstream metrics group by it. |
+| `extra_info` | `struct{...}` | Free-form metadata. The trainer threads `extra_info.index` through for traceability. |
+
+### Custom columns (referenced by `extra_fields`)
+
+Anything you want available as a `<<sentinel>>` in your judge template
+must live somewhere in the parquet row. The path is dotted into the row
+(equivalently, into `data_item.non_tensor_batch` at training time).
+Supported nesting: dicts and integer-indexed lists. Examples:
+
+| Dotted path | Resolves to |
+|---|---|
+| `reward_model.reference_solution` | `row["reward_model"]["reference_solution"]` |
+| `extra_info.difficulty` | `row["extra_info"]["difficulty"]` |
+| `tags.0` | First element of `row["tags"]` |
+| `reference_solution` | Top-level column |
+
+Missing paths log a warning at training time and substitute an empty string
+(your run won't crash on a malformed row), but you'll usually want to catch
+this before launching with the bundled checker.
+
+### Worked example: `HerrHruby/fineproofs`
+
+Schema after the conversion script:
+
+```
+prompt        : list<struct{role: string, content: string}>   # one user turn = INSTRUCTION + problem
+data_source   : string                                         # "aops" | "olympiads"
+ability       : string                                         # "math_proof"
+reward_model  : struct{ground_truth: string, style: string}    # ground_truth = rubric, style = "rubric"
+extra_info    : struct{index: string}                          # stable SHA1-derived row id
+```
+
+Loadable via `datasets.load_dataset("HerrHruby/fineproofs")` or directly as
+a parquet path. The conversion script lives at
+`scripts/convert_fineproof_to_dapo.py`.
+
+### Validating a dataset
+
+`verl/utils/judge/check_dataset.py` ships a checker that walks every row and
+verifies the schema (and any `extra_fields` paths) before you spend GPU
+time on a misconfigured run.
+
+CLI:
+
+```bash
+# Basic schema check
+python -m verl.utils.judge.check_dataset \
+    --parquet /path/to/data.parquet
+
+# Plus validate extra_fields paths (mirrors reward.reward_kwargs.judge.extra_fields)
+python -m verl.utils.judge.check_dataset \
+    --parquet /path/to/data.parquet \
+    --extra-field reference_solution=reward_model.reference_solution
+
+# Fast spot-check on a sample
+python -m verl.utils.judge.check_dataset \
+    --parquet /path/to/data.parquet \
+    --sample-size 200
+```
+
+Programmatic:
+
+```python
+from verl.utils.judge.check_dataset import check_dataset
+
+report = check_dataset(
+    "/path/to/data.parquet",
+    extra_fields={"reference_solution": "reward_model.reference_solution"},
+)
+assert report.ok, report
+```
+
+The checker exits non-zero on any error and caps row-error output at 25 to
+keep the report digestible. Errors include: missing required columns,
+malformed `prompt` entries, non-string `ground_truth`, unresolvable
+`extra_fields` paths. Warnings include: missing recommended columns
+(`ability`, `extra_info`), prompts without a `user` message, empty
+`extra_fields` values.
+
 ## Quick start
 
 Minimum config to switch on (Hydra overrides):

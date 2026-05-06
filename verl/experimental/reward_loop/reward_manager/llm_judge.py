@@ -32,6 +32,7 @@ from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.judge.client import JudgeClient
+from verl.utils.judge.paths import resolve_dotted
 from verl.utils.reward_score import math_proof
 
 
@@ -154,7 +155,7 @@ class LLMJudgeRewardManager(RewardManagerBase):
         resolved: dict[str, Any] = {}
         for var_name, path in self._extra_fields_paths.items():
             try:
-                resolved[var_name] = _resolve_dotted(data_item.non_tensor_batch, path)
+                resolved[var_name] = resolve_dotted(data_item.non_tensor_batch, path)
             except (KeyError, TypeError, IndexError) as exc:
                 # Don't abort training on a missing field; log and substitute "".
                 resolved[var_name] = ""
@@ -197,16 +198,3 @@ class LLMJudgeRewardManager(RewardManagerBase):
         return self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
 
 
-def _resolve_dotted(root: Any, path: str) -> Any:
-    """Walk a dotted path through dict-like and list-like structures."""
-    cur = root
-    for key in path.split("."):
-        if isinstance(cur, dict):
-            cur = cur[key]
-        else:
-            # numpy structured access / list indexing
-            if key.isdigit():
-                cur = cur[int(key)]
-            else:
-                cur = cur[key]
-    return cur
