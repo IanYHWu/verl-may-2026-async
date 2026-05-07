@@ -165,21 +165,27 @@ async def compute_score(
             "had_think_tag": had_think_tag,
         }
 
-    judge_text = result["content"]
+    judge_text = result["content"] or ""
     raw = parse_score(judge_text, max_score=max_score)
     if raw is None:
+        finish_reason = result.get("finish_reason")
         logger.warning(
-            "LLM judge produced unparseable output (data_source=%s, head=%s)",
+            "LLM judge produced unparseable output "
+            "(data_source=%s, finish_reason=%s, head=%r)",
             data_source,
+            finish_reason,
             judge_text[:200].replace("\n", " "),
         )
+        # If the judge ran out of tokens before emitting content, it's a
+        # budget problem (raise max_output_tokens), not a model problem.
+        err = "truncated_no_content" if finish_reason == "length" and not judge_text else "parse_failure"
         return {
             "score": float(on_error_score) / float(max_score) if max_score else 0.0,
             "raw_score": None,
             "judge_text": judge_text,
             "judge_latency_s": result["latency_s"],
             "judge_attempts": result["attempts"],
-            "judge_error": "parse_failure",
+            "judge_error": err,
             "had_think_tag": had_think_tag,
         }
 
