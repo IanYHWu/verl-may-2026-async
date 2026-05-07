@@ -203,9 +203,9 @@ verl/utils/reward_score/math_proof.py   # async compute_score for rubrics
 verl/experimental/reward_loop/reward_manager/
   llm_judge.py              # the LLMJudgeRewardManager class
 docs/
-  qwen3_4b_inst_acemath_mode1_config.md  # Mode 1 reference run config
-  advance/fully_async.md                  # upstream's async-training doc
-ASYNC_EXPERIMENT.md         # async-vs-colocate verification protocol
+  advance/fully_async.md    # upstream's async-training doc
+scripts/data/
+  convert_fineproof_to_dapo.py  # parquet → DAPO chat format converter
 scripts/sample_scripts/     # portable launcher templates
   qwen35_4b_32k_colocate.sh                  # GRPO, hybrid engine, 32k
   qwen35_4b_dapo_async_mode1_40k.sh          # Qwen3.5 + DAPO Math, Mode 1
@@ -263,8 +263,8 @@ TRAIN_FILE=/path/to/train.parquet \
 
 The Mode 1 reference config (Qwen3-4B-Instruct on AceMath DAPO, 4 trainer +
 4 rollout, 16k responses, GRPO with DAPO clip-higher 0.20/0.28, lr=1e-6,
-wd=0.01, mbsz=32, n=8, 100 cycles → 200 grad updates) is documented in
-[`docs/qwen3_4b_inst_acemath_mode1_config.md`](docs/qwen3_4b_inst_acemath_mode1_config.md).
+wd=0.01, mbsz=32, n=8, 100 cycles → 200 grad updates) is set inside the
+launcher itself.
 
 **Mode 4 — async stream pipeline + partial rollout** (`trigger=4`,
 `staleness=0.5`, `partial_rollout=True`, `require_batches=1`). Best
@@ -436,10 +436,13 @@ this reason.
 
 ## Pointers
 
-- [`ASYNC_EXPERIMENT.md`](ASYNC_EXPERIMENT.md) — async verification protocol
-  (what to watch, what to compare, how to tell if sync is broken).
-- [`docs/qwen3_4b_inst_acemath_mode1_config.md`](docs/qwen3_4b_inst_acemath_mode1_config.md) —
-  Mode 1 reference run hyperparameters.
+- [`scripts/sample_scripts/`](scripts/sample_scripts/) — portable launcher
+  templates for the validated configurations (colocate / Mode 1 / Mode 4 on
+  Qwen3-Instruct + AceMath, Qwen3.5 + DAPO Math, Qwen3.5 + Fineproofs with
+  LLM judge). Set `HF_MODEL_PATH` and `TRAIN_FILE` and run.
+- [`scripts/data/`](scripts/data/) — dataset preprocessing utilities (e.g.,
+  the Fineproofs → DAPO chat format converter that uploaded
+  [`HerrHruby/fineproofs`](https://huggingface.co/datasets/HerrHruby/fineproofs)).
 - [`verl/utils/judge/README.md`](verl/utils/judge/README.md) — LLM-as-judge
   full guide: architecture, dataset format, customization, Cloudflare hosting.
 - [`docs/advance/fully_async.md`](docs/advance/fully_async.md) — upstream's
