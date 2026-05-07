@@ -28,17 +28,30 @@ on top of upstream:
 
 ## Install
 
-The B200 / H100 + Megatron + Qwen3.5 stack is non-trivial to assemble. The
-sequence below is what produced our verified env (verified 2026-05).
+The B200 / H100 + Megatron + Qwen3.5 stack is non-trivial to assemble. We
+ship an end-to-end installer at
+[`scripts/install_verl_megatron.sh`](scripts/install_verl_megatron.sh) that
+performs every step below in order and aborts on the first failure so you
+can re-run from where it stopped.
 
-**Verified version pins:**
+```bash
+conda create -n verl_megatron python=3.10
+conda activate verl_megatron
+export CUDA_HOME=/usr/local/cuda      # or wherever your toolkit lives
+bash scripts/install_verl_megatron.sh
+```
+
+Total wall time on a fresh env is ~30–60 minutes (apex + flash-attn from
+source dominate).
+
+### Verified version pins
 
 | Component | Version |
 |---|---|
 | python | 3.10 |
 | torch | 2.10.0 |
 | triton | 3.6.0 |
-| transformer_engine | 2.13.0 (cu12) |
+| transformer_engine | 2.13.0 (cu12, source build) |
 | flash_attn | 2.8.3 (sm100 source build for B200) |
 | megatron-core | 0.16.1 |
 | vllm | 0.19.1 |
@@ -48,121 +61,57 @@ sequence below is what produced our verified env (verified 2026-05).
 | nvidia-cudnn-cu12 | 9.10.2.21 |
 | nvidia-nccl-cu12 | 2.27.5 |
 
-### 1. Fresh conda env
+### What the installer does
 
-```bash
-conda create -n verl_megatron python=3.10
-conda activate verl_megatron
-```
+The installer is structured as 10 ordered, idempotent-on-rerun steps. If
+you'd rather run them by hand, the same steps are reproduced here.
 
-### 2. cudnn first
-
-TransformerEngine `dlopen`s `libcudnn_graph.so.9` at import time, so the
-cudnn wheel must be present before TE is built.
-
-```bash
-pip install nvidia-cudnn-cu12
-```
-
-### 3. Run the upstream stack installer, then upgrade
-
-The bundled installer pins older versions of vLLM / TE / megatron-core that
-don't ABI-match torch 2.10 + sm100 (Blackwell). Run it first to get most of
-the deps, then upgrade individually.
-
-```bash
-# Run the upstream installer up to (but not including) the TE step.
-# Either comment out steps 4–6 in the script and re-run, or run lines by
-# hand up to the TE block.
-USE_MEGATRON=1 USE_SGLANG=0 bash scripts/install_vllm_sglang_mcore.sh
-```
-
-### 4. TransformerEngine 2.13 (source build)
-
-The prebuilt 2.6 wheel was compiled against an older torch and fails on
-torch 2.10 with `undefined symbol: _ZNK3c106SymInt6sym_neERKS0_`. Build
-2.13 from source against the active torch. `--no-build-isolation` reuses
-the installed torch / cudnn / nccl wheels rather than pulling fresh
-isolated copies. The build needs `CPATH` / `LIBRARY_PATH` pointing at the
-cudnn + nccl wheel headers:
-
-```bash
-CUDNN_LOC=$(pip show nvidia-cudnn-cu12 | grep Location | cut -d' ' -f2)
-NCCL_LOC=$(pip show nvidia-nccl-cu12  | grep Location | cut -d' ' -f2)
-export CPATH=$CUDNN_LOC/nvidia/cudnn/include:$NCCL_LOC/nvidia/nccl/include:${CPATH:-}
-export LIBRARY_PATH=$CUDNN_LOC/nvidia/cudnn/lib:$NCCL_LOC/nvidia/nccl/lib:${LIBRARY_PATH:-}
-
-NVTE_FRAMEWORK=pytorch pip install --no-build-isolation --no-deps \
-    git+https://github.com/NVIDIA/TransformerEngine.git@v2.13
-```
-
-### 5. Megatron-Core 0.16.1
-
-```bash
-pip install --no-deps --upgrade \
-    git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.16.1
-```
-
-### 6. vLLM 0.19.1
-
-```bash
-pip install --upgrade vllm==0.19.1
-```
-
-### 7. flash-attn 2.8.3
-
-The prebuilt wheel was linked against an older torch and fails with
-`undefined symbol: c10::cuda::c10_cuda_check_implementation(...)`. Rebuild
-from source against torch 2.10 + sm100 for Blackwell:
-
-```bash
-pip install --upgrade --no-build-isolation flash-attn==2.8.3
-```
-
-H100 users can skip the source build and use the prebuilt wheel.
-
-### 8. apex from source (CPP + CUDA extensions)
-
-```bash
-git clone https://github.com/NVIDIA/apex.git && cd apex && \
-    MAX_JOB=16 pip install -v --disable-pip-version-check --no-cache-dir \
-    --no-build-isolation \
-    --config-settings "--build-option=--cpp_ext" \
-    --config-settings "--build-option=--cuda_ext" ./ && \
-    cd ..
-```
-
-### 9. mbridge pinned commit
-
-mbridge is not on PyPI as a wheel that matches Megatron-Core 0.16.1 — install
-from git pinned to the verified commit:
-
-```bash
-pip install git+https://github.com/ISEEKYAN/mbridge.git@4cfd6f5eab84ed5424a8202e1a282e6ac584fce5
-```
-
-### 10. flash-linear-attention
-
-Megatron-Core's `GatedDeltaNet` imports `fla.modules.l2norm.l2norm` and
-`fla.ops.gated_delta_rule.chunk_gated_delta_rule`.
-
-```bash
-pip install flash-linear-attention==0.4.2
-```
-
-### 11. Install verl itself
-
-```bash
-pip install --no-deps -e .
-```
+1. **`pip install nvidia-cudnn-cu12`.** TransformerEngine `dlopen`s
+   `libcudnn_graph.so.9` at import time, so cudnn must be on disk before
+   TE is built.
+2. **`USE_MEGATRON=1 USE_SGLANG=0 bash scripts/install_vllm_sglang_mcore.sh`.**
+   The upstream verl stack installer. It pins older versions of vLLM, TE,
+   and Megatron-LM that don't ABI-match torch 2.10 + sm100; we upgrade
+   each in subsequent steps.
+3. **Discover cudnn + nccl include / lib dirs.** Export `CPATH`,
+   `LIBRARY_PATH`, and `LD_LIBRARY_PATH` from
+   `pip show nvidia-cudnn-cu12 | grep Location` and the nccl equivalent so
+   the source builds in steps 4 and 7 link correctly.
+4. **TransformerEngine 2.13 from source.** The prebuilt 2.6 wheel fails
+   against torch 2.10 with
+   `undefined symbol: _ZNK3c106SymInt6sym_neERKS0_`. We build 2.13 from
+   source against the active torch:
+   ```
+   NVTE_FRAMEWORK=pytorch pip install --no-build-isolation --no-deps --upgrade \
+       git+https://github.com/NVIDIA/TransformerEngine.git@v2.13
+   ```
+5. **Megatron-Core 0.16.1.** Newer than what step 2 pinned.
+   ```
+   pip install --no-deps --upgrade \
+       git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.16.1
+   ```
+6. **vLLM 0.19.1.** Upgrade past the older pin.
+   ```
+   pip install --upgrade vllm==0.19.1
+   ```
+7. **flash-attn 2.8.3 source build.** The prebuilt wheel was linked
+   against an older torch and fails with `undefined symbol:
+   c10::cuda::c10_cuda_check_implementation(...)`. The source build runs
+   on B200 (sm100) and H100 (sm90).
+   ```
+   pip install --upgrade --no-build-isolation flash-attn==2.8.3
+   ```
+8. **apex from source.** CPP + CUDA extensions. Slow.
+9. **mbridge pinned commit.** mbridge isn't on PyPI as a wheel that
+   matches Megatron-Core 0.16.1 — install from git at `4cfd6f5e`.
+10. **`flash-linear-attention==0.4.2`** plus `pip install --no-deps -e .`
+    to install verl itself.
 
 ### Runtime LD_LIBRARY_PATH
 
-TransformerEngine `dlopen`s `libcudnn_graph.so.9` at import time. The
-cudnn + nccl wheel `lib/` directories must be on `LD_LIBRARY_PATH` for any
-launcher you run outside the conda activation that initially sourced them
-— otherwise import fails with `OSError: libcudnn_graph.so.9: cannot open
-shared object file`:
+The same `LD_LIBRARY_PATH` that the installer set must be on the env at
+*runtime* too — otherwise import fails with
+`OSError: libcudnn_graph.so.9: cannot open shared object file`:
 
 ```bash
 CUDNN_LOC=$(pip show nvidia-cudnn-cu12 | grep Location | cut -d' ' -f2)
@@ -171,9 +120,11 @@ export LD_LIBRARY_PATH=$CUDNN_LOC/nvidia/cudnn/lib:$NCCL_LOC/nvidia/nccl/lib:$CU
 ```
 
 The launchers in `scripts/sample_scripts/` set this themselves at the top
-of each file.
+of each file. The installer prints this snippet at the end as a reminder.
 
 ### Sanity check
+
+The installer ends with a Python import check. Re-run it manually any time:
 
 ```bash
 python -c "
@@ -280,6 +231,113 @@ The async path emits the standard verl signals plus a few we lean on:
 - `timing_s/param_sync` non-zero per cycle confirms the
   `CheckpointEngineManager` NCCL+IPC path is doing real work.
 - `critic/score/mean` trends up over 20–30 grad updates — actual learning.
+
+## Reducing memory pressure
+
+Long-context RL on Qwen3.5 burns memory on three fronts: optimizer state
+(Adam moments, ~12 bytes/param), activations during the trainer's backward
+pass, and the rollouter's vLLM KV cache. The knobs below are listed roughly
+in order of "free" → "expensive in throughput". Stack them as needed.
+
+### Activation checkpointing (recompute)
+
+The first thing to enable. Trades compute for activation memory by
+re-running selected forward layers during backward. The bundled launchers
+already set:
+
+```yaml
+actor_rollout_ref.actor.megatron.override_transformer_config:
+  recompute_granularity: full      # checkpoint all activations between layers
+  recompute_method: uniform        # uniform layer split
+  recompute_num_layers: 1          # number of layers in each recompute group
+```
+
+`full` + `uniform` recompute_method + `recompute_num_layers=1` is the most
+aggressive setting — every layer is re-run during backward. For shorter
+contexts where you have memory headroom, `recompute_num_layers=2` (half
+the recompute cost, slightly more activation memory) is a reasonable
+intermediate.
+
+### Optimizer state offload (Adam moments → CPU)
+
+Adam's first/second moment buffers double the parameter footprint. With
+distributed-Adam they're sharded, but at 4B params still ~24 GiB sharded
+2-way. Offloading them to CPU is the single biggest GPU-memory win for
+single-trainer-pool runs:
+
+```yaml
+actor_rollout_ref.actor.optim:
+  override_optimizer_config:
+    optimizer_cpu_offload: true              # move Adam state to CPU
+    optimizer_offload_fraction: 1            # 0.0–1.0; 1.0 = all of it
+    use_precision_aware_optimizer: true      # fp32 master, bf16 grads
+    overlap_cpu_optimizer_d2h_h2d: true      # hide PCIe transfer behind compute
+```
+
+`overlap_cpu_optimizer_d2h_h2d=true` is critical — without it the H↔D
+transfer runs serial with the optimizer step and dominates wall time.
+
+### Param / grad offload (Megatron Distributed Optimizer)
+
+For colocate runs where vLLM and the trainer share GPUs, offloading
+parameters and gradients to CPU between rollout and training keeps the
+rollouter's KV cache from getting starved. Set on the trainer side:
+
+```yaml
+actor_rollout_ref.actor.megatron:
+  param_offload: true             # parameters → CPU when not in use
+  grad_offload: true              # grad buffers → CPU
+  optimizer_offload: true         # whole DistOpt state, not just Adam moments
+```
+
+In **separated trainer/rollouter** (Mode 1/4) these are typically `false`
+because the trainer pool isn't competing with vLLM for memory. In
+**colocate**, set all three to `true`.
+
+### Sequence parallel (TP-side)
+
+Megatron's sequence parallel splits the activations along the sequence
+dimension within each tensor-parallel group, cutting per-rank activation
+memory by `TP×`. It's enabled automatically when `TP > 1` and the model
+opts in; you'll see `sequence_parallel=True` in the printed
+`Qwen3_5VLTransformerConfig`. The bundled launchers all use
+`tensor_model_parallel_size=2`, so SP is on by default.
+
+> Sequence parallel ≠ context parallel. CP would split the sequence
+> *across* TP groups (not within them), but it requires THD packing,
+> which Qwen3.5's GDN rejects. CP must stay at 1 — see
+> [Qwen3.5 limitations](#qwen35-limitations--patch-rationale).
+
+### vLLM KV cache budget
+
+On the rollouter side, control the fraction of GPU memory vLLM reserves
+for its KV cache:
+
+```yaml
+actor_rollout_ref.rollout:
+  gpu_memory_utilization: 0.7    # 0.7 leaves ~30% for the trainer / Megatron
+  enable_chunked_prefill: true    # smaller per-step prefill chunks
+  enforce_eager: false            # let vLLM compile cudagraphs
+```
+
+For Mode 4 with 65k responses on B200 we bump this to 0.85; for colocate
+where the trainer also lives on the rollout GPUs, keep it ≤ 0.7.
+
+### Reducing micro-batch size
+
+Qwen3.5 already requires `ppo_micro_batch_size_per_gpu=1` because BSHD
+forces static batches; you can't go lower. If a single prompt's longest
+response still doesn't fit, the only knobs are dropping the response
+length cap, dropping `tensor_model_parallel_size` (more shards), or moving
+to a bigger GPU.
+
+### Quick recipe by GPU
+
+| Situation | Stack |
+|---|---|
+| 8× B200 (180 GiB), Qwen3.5-4B, 32k–65k responses | Recompute=full, optimizer_cpu_offload=true, gpu_mem_util=0.7–0.85, async (Mode 4 for 65k) |
+| 8× H100 (80 GiB), Qwen3.5-4B, 16k responses | Recompute=full, optimizer_cpu_offload=true, gpu_mem_util=0.7, async Mode 1 (validated reference) |
+| Colocate (any GPU), Qwen3.5-4B | All of the above + `param_offload=true`, `grad_offload=true`, `optimizer_offload=true` on the trainer side |
 
 ## LLM-as-judge reward
 
