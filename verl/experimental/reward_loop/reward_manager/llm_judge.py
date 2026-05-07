@@ -54,16 +54,17 @@ class LLMJudgeRewardManager(RewardManagerBase):
         reward_model_tokenizer: Any = None,
     ):
         super().__init__(config, tokenizer, compute_score)
-        # If user supplies a custom_reward_function, prefer that; otherwise
-        # default to math_proof.compute_score (LLM-judge scoring).
-        self.compute_score = compute_score or math_proof.compute_score
-        self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
-        if not self.is_async_reward_score:
-            raise ValueError(
-                "LLMJudgeRewardManager requires an async compute_score. "
-                "Either omit custom_reward_function (uses math_proof.compute_score) "
-                "or supply an `async def` reward function."
-            )
+        # `load_reward_manager` always passes *something* in: an async
+        # custom_reward_function if the user configured one, otherwise the
+        # *sync* rule-based default_compute_score. We only honor
+        # `compute_score` when it's async; otherwise fall back to our own
+        # async math_proof.compute_score (the canonical LLM-judge entrypoint).
+        if compute_score is not None and inspect.iscoroutinefunction(compute_score):
+            self.compute_score = compute_score
+        else:
+            self.compute_score = math_proof.compute_score
+        # By construction self.compute_score is async.
+        self.is_async_reward_score = True
 
         judge_cfg = config.reward.get("reward_kwargs", {}).get("judge", None)
         if judge_cfg is None:

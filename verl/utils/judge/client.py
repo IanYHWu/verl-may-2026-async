@@ -135,12 +135,21 @@ class JudgeClient:
                     import json as _json
 
                     data = _json.loads(text)
-                    content = data["choices"][0]["message"]["content"]
+                    choice = data["choices"][0]
+                    message = choice.get("message", {})
+                    # OpenAI-compatible: the final answer is in `content`.
+                    # gpt-oss-style servers may also emit a separate `reasoning`
+                    # field that we *don't* want to grade on; if `content` is
+                    # null/empty (typically because max_tokens cut off before
+                    # the model exited reasoning), surface "" so parse_score
+                    # cleanly hits the parse_failure path.
+                    content = message.get("content") or ""
                     return {
                         "content": content,
                         "latency_s": latency,
                         "attempts": attempt + 1,
                         "raw": data,
+                        "finish_reason": choice.get("finish_reason"),
                     }
             except PermissionError:
                 # Don't retry on 4xx.
