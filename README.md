@@ -15,10 +15,6 @@ on top of upstream:
   We've validated Qwen3.5-4B on `fully_async_policy` Mode 1 (on-policy
   pipeline) and Mode 4 (async stream + partial rollout) end-to-end at 40k
   and 65k response lengths.
-- **Per-step wandb logging** in the fully-async trainer. The upstream code
-  only flushed metrics at param-sync time (every `trigger_parameter_sync_step`
-  iters), which collapses within-cycle reward dynamics into a single average
-  in Mode 4. Now every grad update emits a per-step row.
 - **LLM-as-judge reward manager.** A new `llm_judge` reward manager calls a
   hosted OpenAI-compatible chat-completions endpoint (e.g. a Cloudflare
   Worker proxying gpt-oss / qwen / Anthropic) for rubric-based grading of
@@ -225,8 +221,7 @@ script you're running for the full command.
 
 ### Colocate (hybrid engine)
 
-Trainer and rollout share the same GPUs via vLLM's hybrid engine. Best for
-short-response workloads or as the known-good baseline.
+Trainer and rollout share the same GPUs via vLLM's hybrid engine.
 
 ```bash
 # Set HF_MODEL_PATH and TRAIN_FILE (DAPO-format parquet) as env vars,
