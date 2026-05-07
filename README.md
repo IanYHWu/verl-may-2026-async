@@ -1,15 +1,16 @@
 # Verl (May 2026 Fork)
 
 A fork of [verl](https://github.com/volcengine/verl) tracked against May 2026
-upstream HEAD, with the patches needed to run **Qwen3.5** RL on Blackwell
-(B200, SM100) with the **fully-async** trainer/rollouter pipeline. Headline
-additions on top of upstream:
+upstream HEAD, with the patches needed to run **Qwen3.5** RL with the
+**fully-async** trainer/rollouter pipeline. Validated end-to-end on **B200
+(SM100 / Blackwell)** and **H100 (SM90 / Hopper)** GPUs. Headline additions
+on top of upstream:
 
 - **Qwen3.5 hybrid attention (dense + GatedDeltaNet) trains end-to-end** with
   Megatron-Core + mbridge in BSHD layout. The GDN linear-attention path
   rejects packed (THD) sequences, so we route Qwen3.5 through a non-VL
-  forward and pad statically; details in
-  [`docs/b200_qwen35_megatron_bringup.md`](docs/b200_qwen35_megatron_bringup.md).
+  forward and pad statically. Architecture and patch rationale in
+  [Qwen3.5 limitations](#qwen35-limitations--patch-rationale) below.
 - **Async (decoupled trainer/rollouter) is the default for long-context RL.**
   We've validated Qwen3.5-4B on `fully_async_policy` Mode 1 (on-policy
   pipeline) and Mode 4 (async stream + partial rollout) end-to-end at 40k
@@ -31,52 +32,131 @@ additions on top of upstream:
 
 ## Install
 
-The Blackwell + Megatron + Qwen3.5 stack is non-trivial to assemble. The
-sequence below is what produced our verified env. Runtime versions:
-torch 2.10 · TE 2.13 · flash-attn 2.8.3 · megatron-core 0.16.1 · vLLM 0.19.1
-· mbridge 0.15.1 · flash-linear-attention 0.4.2.
+The B200 / H100 + Megatron + Qwen3.5 stack is non-trivial to assemble. The
+sequence below is what produced our verified env (verified 2026-05).
+
+**Verified version pins:**
+
+| Component | Version |
+|---|---|
+| python | 3.10 |
+| torch | 2.10.0 |
+| triton | 3.6.0 |
+| transformer_engine | 2.13.0 (cu12) |
+| flash_attn | 2.8.3 (sm100 source build for B200) |
+| megatron-core | 0.16.1 |
+| vllm | 0.19.1 |
+| apex | 0.1 (source build) |
+| mbridge | 0.15.1 (git: `4cfd6f5e`) |
+| flash-linear-attention | 0.4.2 |
+| nvidia-cudnn-cu12 | 9.10.2.21 |
+| nvidia-nccl-cu12 | 2.27.5 |
+
+### 1. Fresh conda env
 
 ```bash
-# 1. Fresh conda env (Python 3.10).
 conda create -n verl_megatron python=3.10
 conda activate verl_megatron
+```
 
-# 2. cudnn first — TransformerEngine dlopens libcudnn_graph.so.9 at import.
+### 2. cudnn first
+
+TransformerEngine `dlopen`s `libcudnn_graph.so.9` at import time, so the
+cudnn wheel must be present before TE is built.
+
+```bash
 pip install nvidia-cudnn-cu12
+```
 
-# 3. Run the upstream stack installer, BUT stop before the TE step (step 4
-#    in the script) — we'll handle TE ourselves below to control build flags.
-#    Comment out the TE + Megatron-LM lines in the script first, or run by
-#    hand up to that point.
+### 3. Run the upstream stack installer, then upgrade
+
+The bundled installer pins older versions of vLLM / TE / megatron-core that
+don't ABI-match torch 2.10 + sm100 (Blackwell). Run it first to get most of
+the deps, then upgrade individually.
+
+```bash
+# Run the upstream installer up to (but not including) the TE step.
+# Either comment out steps 4–6 in the script and re-run, or run lines by
+# hand up to the TE block.
 USE_MEGATRON=1 USE_SGLANG=0 bash scripts/install_vllm_sglang_mcore.sh
+```
 
-# 4. Install TransformerEngine from source against the active torch.
-#    --no-build-isolation reuses the already-installed torch / cudnn /
-#    nccl wheels rather than pulling a fresh isolated copy.
+### 4. TransformerEngine 2.13 (source build)
+
+The prebuilt 2.6 wheel was compiled against an older torch and fails on
+torch 2.10 with `undefined symbol: _ZNK3c106SymInt6sym_neERKS0_`. Build
+2.13 from source against the active torch. `--no-build-isolation` reuses
+the installed torch / cudnn / nccl wheels rather than pulling fresh
+isolated copies. The build needs `CPATH` / `LIBRARY_PATH` pointing at the
+cudnn + nccl wheel headers:
+
+```bash
+CUDNN_LOC=$(pip show nvidia-cudnn-cu12 | grep Location | cut -d' ' -f2)
+NCCL_LOC=$(pip show nvidia-nccl-cu12  | grep Location | cut -d' ' -f2)
+export CPATH=$CUDNN_LOC/nvidia/cudnn/include:$NCCL_LOC/nvidia/nccl/include:${CPATH:-}
+export LIBRARY_PATH=$CUDNN_LOC/nvidia/cudnn/lib:$NCCL_LOC/nvidia/nccl/lib:${LIBRARY_PATH:-}
+
 NVTE_FRAMEWORK=pytorch pip install --no-build-isolation --no-deps \
-    git+https://github.com/NVIDIA/TransformerEngine.git@v2.6
-# If the v2.6 ABI doesn't line up with torch 2.10 on your stack, repeat
-# against @v2.13 — that's what landed in the verified env.
+    git+https://github.com/NVIDIA/TransformerEngine.git@v2.13
+```
 
-# 5. Install Megatron-LM (the line we skipped from the install script).
-pip install --no-deps git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.13.1
+### 5. Megatron-Core 0.16.1
 
-# 6. Build apex from source (CPP + CUDA extensions). Slow.
+```bash
+pip install --no-deps --upgrade \
+    git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.16.1
+```
+
+### 6. vLLM 0.19.1
+
+```bash
+pip install --upgrade vllm==0.19.1
+```
+
+### 7. flash-attn 2.8.3
+
+The prebuilt wheel was linked against an older torch and fails with
+`undefined symbol: c10::cuda::c10_cuda_check_implementation(...)`. Rebuild
+from source against torch 2.10 + sm100 for Blackwell:
+
+```bash
+pip install --upgrade --no-build-isolation flash-attn==2.8.3
+```
+
+H100 users can skip the source build and use the prebuilt wheel.
+
+### 8. apex from source (CPP + CUDA extensions)
+
+```bash
 git clone https://github.com/NVIDIA/apex.git && cd apex && \
     MAX_JOB=16 pip install -v --disable-pip-version-check --no-cache-dir \
     --no-build-isolation \
     --config-settings "--build-option=--cpp_ext" \
     --config-settings "--build-option=--cuda_ext" ./ && \
     cd ..
+```
 
-# 7. mbridge pinned to the commit the bring-up validated.
+### 9. mbridge pinned commit
+
+mbridge is not on PyPI as a wheel that matches Megatron-Core 0.16.1 — install
+from git pinned to the verified commit:
+
+```bash
 pip install git+https://github.com/ISEEKYAN/mbridge.git@4cfd6f5eab84ed5424a8202e1a282e6ac584fce5
+```
 
-# 8. flash-linear-attention — Megatron-Core's GatedDeltaNet imports
-#    `fla.modules.l2norm.l2norm` and `fla.ops.gated_delta_rule.chunk_gated_delta_rule`.
+### 10. flash-linear-attention
+
+Megatron-Core's `GatedDeltaNet` imports `fla.modules.l2norm.l2norm` and
+`fla.ops.gated_delta_rule.chunk_gated_delta_rule`.
+
+```bash
 pip install flash-linear-attention==0.4.2
+```
 
-# 9. Install verl itself (this fork) in editable mode.
+### 11. Install verl itself
+
+```bash
 pip install --no-deps -e .
 ```
 
@@ -84,7 +164,9 @@ pip install --no-deps -e .
 
 TransformerEngine `dlopen`s `libcudnn_graph.so.9` at import time. The
 cudnn + nccl wheel `lib/` directories must be on `LD_LIBRARY_PATH` for any
-launcher you run outside the conda activation that initially sourced them:
+launcher you run outside the conda activation that initially sourced them
+— otherwise import fails with `OSError: libcudnn_graph.so.9: cannot open
+shared object file`:
 
 ```bash
 CUDNN_LOC=$(pip show nvidia-cudnn-cu12 | grep Location | cut -d' ' -f2)
@@ -92,8 +174,8 @@ NCCL_LOC=$(pip show nvidia-nccl-cu12  | grep Location | cut -d' ' -f2)
 export LD_LIBRARY_PATH=$CUDNN_LOC/nvidia/cudnn/lib:$NCCL_LOC/nvidia/nccl/lib:$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 ```
 
-The launchers in `scripts/` set this themselves. Without it you'll see
-`OSError: libcudnn_graph.so.9: cannot open shared object file` at import.
+The launchers in `scripts/sample_scripts/` set this themselves at the top
+of each file.
 
 ### Sanity check
 
@@ -111,29 +193,27 @@ print('torch', torch.__version__, 'TE', transformer_engine.__version__,
 "
 ```
 
-If any import fails, see the env-bringup notes in
-[`docs/b200_qwen35_megatron_bringup.md`](docs/b200_qwen35_megatron_bringup.md)
-— it documents which wheel ABIs needed source rebuilds against torch 2.10
-on Blackwell, and the `CPATH` / `LIBRARY_PATH` settings the source builds
-require.
-
 ## Repo layout
 
 ```
 verl/                       # forked verl framework
-docs/
-  b200_qwen35_megatron_bringup.md     # ABI-pinned env + Qwen3.5 patches
-  qwen3_4b_inst_acemath_mode1_config.md  # Mode 1 reference run config
-  advance/fully_async.md              # upstream's async-training doc
-ASYNC_EXPERIMENT.md         # async-vs-colocate verification protocol
 verl/utils/judge/           # JudgeClient, parser, templates, README
 verl/utils/judge/README.md  # full LLM-judge usage + customization guide
 verl/utils/reward_score/math_proof.py   # async compute_score for rubrics
 verl/experimental/reward_loop/reward_manager/
   llm_judge.py              # the LLMJudgeRewardManager class
-scripts/
-  qwen35_4b_32k_colocate.sh            # vanilla GRPO, hybrid engine, 32k
-  qwen3_4b_inst_acemath_async_mode1.sh # fully-async Mode 1 reference
+docs/
+  qwen3_4b_inst_acemath_mode1_config.md  # Mode 1 reference run config
+  advance/fully_async.md                  # upstream's async-training doc
+ASYNC_EXPERIMENT.md         # async-vs-colocate verification protocol
+scripts/sample_scripts/     # portable launcher templates
+  qwen35_4b_32k_colocate.sh                  # GRPO, hybrid engine, 32k
+  qwen35_4b_dapo_async_mode1_40k.sh          # Qwen3.5 + DAPO Math, Mode 1
+  qwen35_4b_dapo_async_mode4_40k.sh          # Qwen3.5 + DAPO Math, Mode 4
+  qwen35_4b_fineproof_async_mode4_judge_65k.sh  # Mode 4 + LLM judge, 65k
+  qwen3_4b_inst_acemath_async_mode1.sh       # Qwen3-Inst + AceMath, Mode 1
+  qwen3_4b_inst_acemath_async_mode4.sh       # Qwen3-Inst + AceMath, Mode 4
+  qwen3_4b_inst_acemath_colocate.sh          # Qwen3-Inst + AceMath, colocate
 ```
 
 ## Running training
@@ -149,9 +229,10 @@ Trainer and rollout share the same GPUs via vLLM's hybrid engine. Best for
 short-response workloads or as the known-good baseline.
 
 ```bash
-# Edit HF_MODEL_PATH and TRAIN_FILE / TEST_FILE at the top of the script
-# (or pass them as env vars).
-bash scripts/qwen35_4b_32k_colocate.sh
+# Set HF_MODEL_PATH and TRAIN_FILE (DAPO-format parquet) as env vars,
+# or edit the defaults at the top of the script.
+TRAIN_FILE=/path/to/train.parquet \
+    bash scripts/sample_scripts/qwen35_4b_32k_colocate.sh
 ```
 
 The reference colocate config: 8 GPUs shared, `hybrid_engine=True`, TP=2,
@@ -176,7 +257,8 @@ operating mode (see [`docs/advance/fully_async.md`](docs/advance/fully_async.md)
 ~5pp at matched step counts. Use as the async sanity baseline.
 
 ```bash
-bash scripts/qwen3_4b_inst_acemath_async_mode1.sh
+TRAIN_FILE=/path/to/train.parquet \
+    bash scripts/sample_scripts/qwen3_4b_inst_acemath_async_mode1.sh
 ```
 
 The Mode 1 reference config (Qwen3-4B-Instruct on AceMath DAPO, 4 trainer +
@@ -258,31 +340,90 @@ Full guide, including dataset schema requirements and a checker
 **Tested only with Megatron + vLLM.** The FSDP backend should still work but
 nothing in this fork has been validated against it.
 
-**Qwen3.5 hybrid architecture is the messy case.** Megatron-Core's
-`GatedDeltaNet` (the linear-attention path in the hybrid layers) does not
-accept packed sequences, which cascades into several constraints:
+### Qwen3.5 limitations & patch rationale
 
-- **No THD / no `use_remove_padding`** — must run with
-  `actor.megatron.use_remove_padding=false` *and* `model.use_remove_padding=false`.
-  The forward dispatches in BSHD throughout.
-- **Static micro batches required.** `actor.use_dynamic_bsz=False`,
-  `rollout.log_prob_use_dynamic_bsz=False`,
-  `actor.ppo_micro_batch_size_per_gpu=1`, and the equivalent for
-  log-prob recompute. Padding is to the longest sequence in the batch.
-- **No context parallel.** CP in Megatron requires THD; our TF config runs
-  with `context_parallel_size=1`. Sequence parallel (TP-side) is fine.
-- **Sequence parallel keeps working**, just not context parallel.
-- **Vision tower frozen.** mbridge builds the Qwen3.5 VL stack even for
-  text-only RL; we set `actor.freeze_vision_tower=True` to skip its
-  optimizer / grad bookkeeping.
-- **Optimizer state offloaded to CPU.** Required to fit the 4B model with
-  long contexts on a single B200 trainer pool. Set via
-  `actor.optim.override_optimizer_config.optimizer_cpu_offload=True`.
+Megatron-Core's `GatedDeltaNet` (the linear-attention path in Qwen3.5's
+hybrid attention layers) does not accept packed sequences:
+`NotImplementedError: GDN does not support packed sequence for now`.
+This cascades into the constraints below.
 
-The full rationale, plus the upstream patches that make this work, lives in
-[`docs/b200_qwen35_megatron_bringup.md`](docs/b200_qwen35_megatron_bringup.md).
+#### THD vs BSHD
 
-**Async-mode caveats.**
+verl defaults to **THD** activations
+(`(total_tokens, num_heads, head_dim)` — packed variable-length sequences
+with `cu_seqlens` boundaries) when `actor.megatron.use_remove_padding=true`.
+THD is efficient but not all attention variants consume it. Qwen3.5 forces
+**BSHD** (`(batch, seq_len, num_heads, head_dim)` — padded fixed-shape) so
+the GDN layer can run.
+
+#### Required Hydra overrides for Qwen3.5
+
+These apply on top of the stock `verl/trainer/config/ppo_megatron_trainer.yaml`
+config. The bundled launchers in `scripts/sample_scripts/` already set them.
+
+| Override | Reason |
+|---|---|
+| `actor.megatron.use_remove_padding=false` | BSHD forward (GDN refuses THD). |
+| `model.use_remove_padding=false` | The fully-async path reads from `model.use_remove_padding` (separate from `actor.megatron.use_remove_padding`); both must be set. |
+| `actor.megatron.use_mbridge=true` | mbridge owns the Megatron ↔ HF Qwen3.5 weight bridge. |
+| `actor.megatron.vanilla_mbridge=true` | Routes through the non-VL converter. |
+| `actor.use_dynamic_bsz=false` | BSHD requires static micro batches. |
+| `actor.ppo_micro_batch_size_per_gpu=1` | Same; pad to longest in the batch. |
+| `rollout.log_prob_use_dynamic_bsz=false` | Same on the log-prob recompute path. |
+| `rollout.log_prob_micro_batch_size_per_gpu=1` | Same. |
+| `actor.freeze_vision_tower=true` | mbridge builds the VL stack even for text-only RL; freezing skips its optimizer / grad bookkeeping. |
+| `actor.optim.override_optimizer_config.optimizer_cpu_offload=true` | Required to fit 4B with long contexts on a single trainer pool. |
+| `tensor_model_parallel_size=2`, `pipeline_model_parallel_size=1` | Validated. |
+| `context_parallel_size=1` | **CP is not supported** — see below. |
+| `model.trust_remote_code=true` | Qwen3.5 config has custom Python. |
+
+#### No context parallel
+
+Context parallel (CP) in Megatron requires THD packing. Since Qwen3.5
+forces BSHD, `context_parallel_size` must stay at 1. Sequence parallel (the
+TP-side variant) is unaffected and remains enabled by default.
+
+#### In-tree patches under `verl/`
+
+These are already in this fork; you don't need to apply them by hand.
+
+- **`verl/utils/model.py`** — `transformers` 5.x dropped
+  `AutoModelForVision2Seq`; aliased to `AutoModelForImageTextToText` so verl
+  imports still work.
+- **`verl/models/mcore/registry.py`** — Qwen3.5 dense
+  (`Qwen3_5ForConditionalGeneration`) is deliberately **not** in
+  `SupportedVLM`. That routes it through `model_forward_gen(False)` (the
+  non-VL forward) so the training-side dispatch can take BSHD. The VL
+  forward would force THD, which the GDN rejects.
+- **`verl/models/mcore/model_forward.py`** (BSHD branch) —
+  - Loosened `assert not vision_model` so a VL-routed forward can take BSHD
+    when the batch is text-only.
+  - **MRoPE fix**: when `tf_config.mrope_section` is set
+    (Qwen3.5 / Qwen3-VL), pass `position_ids=None` so `Qwen3_5VLModel`
+    auto-computes 3-D position ids via `get_rope_index`. verl's 1-D
+    `position_ids` would otherwise trip
+    `mbridge/.../rope_utils.py` with
+    `IndexError: too many indices for tensor of dimension 2`.
+- **`verl/experimental/agent_loop/agent_loop.py`** `_compute_position_ids` —
+  - Text-only fast path: when no `image_grid_thw` / `video_grid_thw` is
+    present, skip multimodal RoPE and fall back to
+    `compute_position_id_with_mask(attention_mask)`.
+  - **`mm_token_type_ids` synthesis**: transformers 5.x made it a required
+    positional arg of `Qwen3VLModel.get_rope_index`. The patch synthesizes
+    it from `input_ids` (0 for text, vision-start-token-id for vision
+    tokens) so the call succeeds.
+
+#### Tokenizer compatibility (transformers 5.x)
+
+Any caller of `tokenizer.apply_chat_template(..., tokenize=True)` should
+pass `return_dict=False`. transformers 5.x changed the default return to a
+`BatchEncoding` instead of a flat list of ids, breaking
+`torch.tensor(ids, dtype=torch.long)` with
+`TypeError: 'str' object cannot be interpreted as an integer`. The
+launchers append `+data.apply_chat_template_kwargs.return_dict=false` for
+this reason.
+
+### Async-mode caveats
 
 - The fully-async trainer logs metrics at the end of every grad update *and*
   at every param-sync cycle. Cycle-level keys (e.g. `processing_time/p99`,
@@ -295,9 +436,6 @@ The full rationale, plus the upstream patches that make this work, lives in
 
 ## Pointers
 
-- [`docs/b200_qwen35_megatron_bringup.md`](docs/b200_qwen35_megatron_bringup.md) —
-  ABI-pinned env (torch 2.10 / TE 2.13 / FA 2.8.3 / mbridge / megatron-core
-  0.16.1 / vLLM 0.19.1) and the verl patches required to run Qwen3.5.
 - [`ASYNC_EXPERIMENT.md`](ASYNC_EXPERIMENT.md) — async verification protocol
   (what to watch, what to compare, how to tell if sync is broken).
 - [`docs/qwen3_4b_inst_acemath_mode1_config.md`](docs/qwen3_4b_inst_acemath_mode1_config.md) —

@@ -1,6 +1,7 @@
 # Porting from this fork to upstream verl: regression notes
 
-Companion to [`b200_qwen35_megatron_bringup.md`](b200_qwen35_megatron_bringup.md).
+Companion to the [Install + Limitations](../README.md#install) sections in
+the top-level README (which absorbed the former `b200_qwen35_megatron_bringup.md`).
 
 This fork (`verl-may-2026`, root commit `8f16fc3`) is roughly aligned to a verl
 snapshot from before upstream's "engine workers" refactor. Upstream HEAD at the
