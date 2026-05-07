@@ -53,7 +53,7 @@ validation has been on B200) the async path actually trains.
 - **H100 (FLAME cluster)**: use the launchers in `scripts/` as-is.
   Tested values: `max_response_length=16384`, `gpu_memory_utilization=0.8`,
   `train_batch_size=64`, `ppo_mini_batch_size=32`, `rollout.n=8`.
-- **B200**: read [`docs/b200_qwen35_megatron_bringup.md`](docs/b200_qwen35_megatron_bringup.md)
+- **B200**: read the [Install + Limitations](README.md#install) sections in the top-level README
   before doing anything. It has the verified version pins, the
   build-time CPATH/LIBRARY_PATH trick for `transformer_engine_torch`,
   the runtime `LD_LIBRARY_PATH` workaround for cudnn `dlopen`, and

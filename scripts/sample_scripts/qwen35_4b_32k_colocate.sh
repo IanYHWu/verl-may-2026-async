@@ -6,9 +6,11 @@ set -x
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_USE_V1=1
 
-HF_MODEL_PATH=${HF_MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3.5-4B"}
-TRAIN_FILE=${TRAIN_FILE:-"$HOME/data/dapo-math-17k/train.parquet"}
-TEST_FILE=${TEST_FILE:-"$HOME/data/dapo-math-17k/train.parquet"}  # unused; val disabled
+# Set HF_MODEL_PATH to a local snapshot or a hub id; verl resolves both.
+HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3.5-4B"}
+# DAPO-format parquet (prompt: list[{role,content}], reward_model.ground_truth, ...).
+TRAIN_FILE=${TRAIN_FILE:?TRAIN_FILE must be set (path to a DAPO-format parquet)}
+TEST_FILE=${TEST_FILE:-"$TRAIN_FILE"}  # unused; val disabled
 
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
