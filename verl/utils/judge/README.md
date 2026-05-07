@@ -81,7 +81,7 @@ extra_info    : struct{index: string}                          # stable SHA1-der
 
 Loadable via `datasets.load_dataset("HerrHruby/fineproofs")` or directly as
 a parquet path. The conversion script lives at
-`scripts/convert_fineproof_to_dapo.py`.
+`scripts/data/convert_fineproof_to_dapo.py`.
 
 ### Validating a dataset
 
