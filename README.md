@@ -15,10 +15,6 @@ on top of upstream:
   We've validated Qwen3.5-4B on `fully_async_policy` Mode 1 (on-policy
   pipeline) and Mode 4 (async stream + partial rollout) end-to-end at 40k
   and 65k response lengths.
-- **Per-step wandb logging** in the fully-async trainer. The upstream code
-  only flushed metrics at param-sync time (every `trigger_parameter_sync_step`
-  iters), which collapses within-cycle reward dynamics into a single average
-  in Mode 4. Now every grad update emits a per-step row.
 - **LLM-as-judge reward manager.** A new `llm_judge` reward manager calls a
   hosted OpenAI-compatible chat-completions endpoint (e.g. a Cloudflare
   Worker proxying gpt-oss / qwen / Anthropic) for rubric-based grading of
@@ -32,17 +28,30 @@ on top of upstream:
 
 ## Install
 
-The B200 / H100 + Megatron + Qwen3.5 stack is non-trivial to assemble. The
-sequence below is what produced our verified env (verified 2026-05).
+The B200 / H100 + Megatron + Qwen3.5 stack is non-trivial to assemble. We
+ship an end-to-end installer at
+[`scripts/install_verl_megatron.sh`](scripts/install_verl_megatron.sh) that
+performs every step below in order and aborts on the first failure so you
+can re-run from where it stopped.
 
-**Verified version pins:**
+```bash
+conda create -n verl_megatron python=3.10
+conda activate verl_megatron
+export CUDA_HOME=/usr/local/cuda      # or wherever your toolkit lives
+bash scripts/install_verl_megatron.sh
+```
+
+Total wall time on a fresh env is ~30–60 minutes (apex + flash-attn from
+source dominate).
+
+### Verified version pins
 
 | Component | Version |
 |---|---|
 | python | 3.10 |
 | torch | 2.10.0 |
 | triton | 3.6.0 |
-| transformer_engine | 2.13.0 (cu12) |
+| transformer_engine | 2.13.0 (cu12, source build) |
 | flash_attn | 2.8.3 (sm100 source build for B200) |
 | megatron-core | 0.16.1 |
 | vllm | 0.19.1 |
@@ -52,121 +61,57 @@ sequence below is what produced our verified env (verified 2026-05).
 | nvidia-cudnn-cu12 | 9.10.2.21 |
 | nvidia-nccl-cu12 | 2.27.5 |
 
-### 1. Fresh conda env
+### What the installer does
 
-```bash
-conda create -n verl_megatron python=3.10
-conda activate verl_megatron
-```
+The installer is structured as 10 ordered, idempotent-on-rerun steps. If
+you'd rather run them by hand, the same steps are reproduced here.
 
-### 2. cudnn first
-
-TransformerEngine `dlopen`s `libcudnn_graph.so.9` at import time, so the
-cudnn wheel must be present before TE is built.
-
-```bash
-pip install nvidia-cudnn-cu12
-```
-
-### 3. Run the upstream stack installer, then upgrade
-
-The bundled installer pins older versions of vLLM / TE / megatron-core that
-don't ABI-match torch 2.10 + sm100 (Blackwell). Run it first to get most of
-the deps, then upgrade individually.
-
-```bash
-# Run the upstream installer up to (but not including) the TE step.
-# Either comment out steps 4–6 in the script and re-run, or run lines by
-# hand up to the TE block.
-USE_MEGATRON=1 USE_SGLANG=0 bash scripts/install_vllm_sglang_mcore.sh
-```
-
-### 4. TransformerEngine 2.13 (source build)
-
-The prebuilt 2.6 wheel was compiled against an older torch and fails on
-torch 2.10 with `undefined symbol: _ZNK3c106SymInt6sym_neERKS0_`. Build
-2.13 from source against the active torch. `--no-build-isolation` reuses
-the installed torch / cudnn / nccl wheels rather than pulling fresh
-isolated copies. The build needs `CPATH` / `LIBRARY_PATH` pointing at the
-cudnn + nccl wheel headers:
-
-```bash
-CUDNN_LOC=$(pip show nvidia-cudnn-cu12 | grep Location | cut -d' ' -f2)
-NCCL_LOC=$(pip show nvidia-nccl-cu12  | grep Location | cut -d' ' -f2)
-export CPATH=$CUDNN_LOC/nvidia/cudnn/include:$NCCL_LOC/nvidia/nccl/include:${CPATH:-}
-export LIBRARY_PATH=$CUDNN_LOC/nvidia/cudnn/lib:$NCCL_LOC/nvidia/nccl/lib:${LIBRARY_PATH:-}
-
-NVTE_FRAMEWORK=pytorch pip install --no-build-isolation --no-deps \
-    git+https://github.com/NVIDIA/TransformerEngine.git@v2.13
-```
-
-### 5. Megatron-Core 0.16.1
-
-```bash
-pip install --no-deps --upgrade \
-    git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.16.1
-```
-
-### 6. vLLM 0.19.1
-
-```bash
-pip install --upgrade vllm==0.19.1
-```
-
-### 7. flash-attn 2.8.3
-
-The prebuilt wheel was linked against an older torch and fails with
-`undefined symbol: c10::cuda::c10_cuda_check_implementation(...)`. Rebuild
-from source against torch 2.10 + sm100 for Blackwell:
-
-```bash
-pip install --upgrade --no-build-isolation flash-attn==2.8.3
-```
-
-H100 users can skip the source build and use the prebuilt wheel.
-
-### 8. apex from source (CPP + CUDA extensions)
-
-```bash
-git clone https://github.com/NVIDIA/apex.git && cd apex && \
-    MAX_JOB=16 pip install -v --disable-pip-version-check --no-cache-dir \
-    --no-build-isolation \
-    --config-settings "--build-option=--cpp_ext" \
-    --config-settings "--build-option=--cuda_ext" ./ && \
-    cd ..
-```
-
-### 9. mbridge pinned commit
-
-mbridge is not on PyPI as a wheel that matches Megatron-Core 0.16.1 — install
-from git pinned to the verified commit:
-
-```bash
-pip install git+https://github.com/ISEEKYAN/mbridge.git@4cfd6f5eab84ed5424a8202e1a282e6ac584fce5
-```
-
-### 10. flash-linear-attention
-
-Megatron-Core's `GatedDeltaNet` imports `fla.modules.l2norm.l2norm` and
-`fla.ops.gated_delta_rule.chunk_gated_delta_rule`.
-
-```bash
-pip install flash-linear-attention==0.4.2
-```
-
-### 11. Install verl itself
-
-```bash
-pip install --no-deps -e .
-```
+1. **`pip install nvidia-cudnn-cu12`.** TransformerEngine `dlopen`s
+   `libcudnn_graph.so.9` at import time, so cudnn must be on disk before
+   TE is built.
+2. **`USE_MEGATRON=1 USE_SGLANG=0 bash scripts/install_vllm_sglang_mcore.sh`.**
+   The upstream verl stack installer. It pins older versions of vLLM, TE,
+   and Megatron-LM that don't ABI-match torch 2.10 + sm100; we upgrade
+   each in subsequent steps.
+3. **Discover cudnn + nccl include / lib dirs.** Export `CPATH`,
+   `LIBRARY_PATH`, and `LD_LIBRARY_PATH` from
+   `pip show nvidia-cudnn-cu12 | grep Location` and the nccl equivalent so
+   the source builds in steps 4 and 7 link correctly.
+4. **TransformerEngine 2.13 from source.** The prebuilt 2.6 wheel fails
+   against torch 2.10 with
+   `undefined symbol: _ZNK3c106SymInt6sym_neERKS0_`. We build 2.13 from
+   source against the active torch:
+   ```
+   NVTE_FRAMEWORK=pytorch pip install --no-build-isolation --no-deps --upgrade \
+       git+https://github.com/NVIDIA/TransformerEngine.git@v2.13
+   ```
+5. **Megatron-Core 0.16.1.** Newer than what step 2 pinned.
+   ```
+   pip install --no-deps --upgrade \
+       git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.16.1
+   ```
+6. **vLLM 0.19.1.** Upgrade past the older pin.
+   ```
+   pip install --upgrade vllm==0.19.1
+   ```
+7. **flash-attn 2.8.3 source build.** The prebuilt wheel was linked
+   against an older torch and fails with `undefined symbol:
+   c10::cuda::c10_cuda_check_implementation(...)`. The source build runs
+   on B200 (sm100) and H100 (sm90).
+   ```
+   pip install --upgrade --no-build-isolation flash-attn==2.8.3
+   ```
+8. **apex from source.** CPP + CUDA extensions. Slow.
+9. **mbridge pinned commit.** mbridge isn't on PyPI as a wheel that
+   matches Megatron-Core 0.16.1 — install from git at `4cfd6f5e`.
+10. **`flash-linear-attention==0.4.2`** plus `pip install --no-deps -e .`
+    to install verl itself.
 
 ### Runtime LD_LIBRARY_PATH
 
-TransformerEngine `dlopen`s `libcudnn_graph.so.9` at import time. The
-cudnn + nccl wheel `lib/` directories must be on `LD_LIBRARY_PATH` for any
-launcher you run outside the conda activation that initially sourced them
-— otherwise import fails with `OSError: libcudnn_graph.so.9: cannot open
-shared object file`:
+The same `LD_LIBRARY_PATH` that the installer set must be on the env at
+*runtime* too — otherwise import fails with
+`OSError: libcudnn_graph.so.9: cannot open shared object file`:
 
 ```bash
 CUDNN_LOC=$(pip show nvidia-cudnn-cu12 | grep Location | cut -d' ' -f2)
@@ -175,9 +120,11 @@ export LD_LIBRARY_PATH=$CUDNN_LOC/nvidia/cudnn/lib:$NCCL_LOC/nvidia/nccl/lib:$CU
 ```
 
 The launchers in `scripts/sample_scripts/` set this themselves at the top
-of each file.
+of each file. The installer prints this snippet at the end as a reminder.
 
 ### Sanity check
+
+The installer ends with a Python import check. Re-run it manually any time:
 
 ```bash
 python -c "
@@ -203,9 +150,9 @@ verl/utils/reward_score/math_proof.py   # async compute_score for rubrics
 verl/experimental/reward_loop/reward_manager/
   llm_judge.py              # the LLMJudgeRewardManager class
 docs/
-  qwen3_4b_inst_acemath_mode1_config.md  # Mode 1 reference run config
-  advance/fully_async.md                  # upstream's async-training doc
-ASYNC_EXPERIMENT.md         # async-vs-colocate verification protocol
+  advance/fully_async.md    # upstream's async-training doc
+scripts/data/
+  convert_fineproof_to_dapo.py  # parquet → DAPO chat format converter
 scripts/sample_scripts/     # portable launcher templates
   qwen35_4b_32k_colocate.sh                  # GRPO, hybrid engine, 32k
   qwen35_4b_dapo_async_mode1_40k.sh          # Qwen3.5 + DAPO Math, Mode 1
@@ -225,8 +172,7 @@ script you're running for the full command.
 
 ### Colocate (hybrid engine)
 
-Trainer and rollout share the same GPUs via vLLM's hybrid engine. Best for
-short-response workloads or as the known-good baseline.
+Trainer and rollout share the same GPUs via vLLM's hybrid engine.
 
 ```bash
 # Set HF_MODEL_PATH and TRAIN_FILE (DAPO-format parquet) as env vars,
@@ -263,8 +209,8 @@ TRAIN_FILE=/path/to/train.parquet \
 
 The Mode 1 reference config (Qwen3-4B-Instruct on AceMath DAPO, 4 trainer +
 4 rollout, 16k responses, GRPO with DAPO clip-higher 0.20/0.28, lr=1e-6,
-wd=0.01, mbsz=32, n=8, 100 cycles → 200 grad updates) is documented in
-[`docs/qwen3_4b_inst_acemath_mode1_config.md`](docs/qwen3_4b_inst_acemath_mode1_config.md).
+wd=0.01, mbsz=32, n=8, 100 cycles → 200 grad updates) is set inside the
+launcher itself.
 
 **Mode 4 — async stream pipeline + partial rollout** (`trigger=4`,
 `staleness=0.5`, `partial_rollout=True`, `require_batches=1`). Best
@@ -285,6 +231,113 @@ The async path emits the standard verl signals plus a few we lean on:
 - `timing_s/param_sync` non-zero per cycle confirms the
   `CheckpointEngineManager` NCCL+IPC path is doing real work.
 - `critic/score/mean` trends up over 20–30 grad updates — actual learning.
+
+## Reducing memory pressure
+
+Long-context RL on Qwen3.5 burns memory on three fronts: optimizer state
+(Adam moments, ~12 bytes/param), activations during the trainer's backward
+pass, and the rollouter's vLLM KV cache. The knobs below are listed roughly
+in order of "free" → "expensive in throughput". Stack them as needed.
+
+### Activation checkpointing (recompute)
+
+The first thing to enable. Trades compute for activation memory by
+re-running selected forward layers during backward. The bundled launchers
+already set:
+
+```yaml
+actor_rollout_ref.actor.megatron.override_transformer_config:
+  recompute_granularity: full      # checkpoint all activations between layers
+  recompute_method: uniform        # uniform layer split
+  recompute_num_layers: 1          # number of layers in each recompute group
+```
+
+`full` + `uniform` recompute_method + `recompute_num_layers=1` is the most
+aggressive setting — every layer is re-run during backward. For shorter
+contexts where you have memory headroom, `recompute_num_layers=2` (half
+the recompute cost, slightly more activation memory) is a reasonable
+intermediate.
+
+### Optimizer state offload (Adam moments → CPU)
+
+Adam's first/second moment buffers double the parameter footprint. With
+distributed-Adam they're sharded, but at 4B params still ~24 GiB sharded
+2-way. Offloading them to CPU is the single biggest GPU-memory win for
+single-trainer-pool runs:
+
+```yaml
+actor_rollout_ref.actor.optim:
+  override_optimizer_config:
+    optimizer_cpu_offload: true              # move Adam state to CPU
+    optimizer_offload_fraction: 1            # 0.0–1.0; 1.0 = all of it
+    use_precision_aware_optimizer: true      # fp32 master, bf16 grads
+    overlap_cpu_optimizer_d2h_h2d: true      # hide PCIe transfer behind compute
+```
+
+`overlap_cpu_optimizer_d2h_h2d=true` is critical — without it the H↔D
+transfer runs serial with the optimizer step and dominates wall time.
+
+### Param / grad offload (Megatron Distributed Optimizer)
+
+For colocate runs where vLLM and the trainer share GPUs, offloading
+parameters and gradients to CPU between rollout and training keeps the
+rollouter's KV cache from getting starved. Set on the trainer side:
+
+```yaml
+actor_rollout_ref.actor.megatron:
+  param_offload: true             # parameters → CPU when not in use
+  grad_offload: true              # grad buffers → CPU
+  optimizer_offload: true         # whole DistOpt state, not just Adam moments
+```
+
+In **separated trainer/rollouter** (Mode 1/4) these are typically `false`
+because the trainer pool isn't competing with vLLM for memory. In
+**colocate**, set all three to `true`.
+
+### Sequence parallel (TP-side)
+
+Megatron's sequence parallel splits the activations along the sequence
+dimension within each tensor-parallel group, cutting per-rank activation
+memory by `TP×`. It's enabled automatically when `TP > 1` and the model
+opts in; you'll see `sequence_parallel=True` in the printed
+`Qwen3_5VLTransformerConfig`. The bundled launchers all use
+`tensor_model_parallel_size=2`, so SP is on by default.
+
+> Sequence parallel ≠ context parallel. CP would split the sequence
+> *across* TP groups (not within them), but it requires THD packing,
+> which Qwen3.5's GDN rejects. CP must stay at 1 — see
+> [Qwen3.5 limitations](#qwen35-limitations--patch-rationale).
+
+### vLLM KV cache budget
+
+On the rollouter side, control the fraction of GPU memory vLLM reserves
+for its KV cache:
+
+```yaml
+actor_rollout_ref.rollout:
+  gpu_memory_utilization: 0.7    # 0.7 leaves ~30% for the trainer / Megatron
+  enable_chunked_prefill: true    # smaller per-step prefill chunks
+  enforce_eager: false            # let vLLM compile cudagraphs
+```
+
+For Mode 4 with 65k responses on B200 we bump this to 0.85; for colocate
+where the trainer also lives on the rollout GPUs, keep it ≤ 0.7.
+
+### Reducing micro-batch size
+
+Qwen3.5 already requires `ppo_micro_batch_size_per_gpu=1` because BSHD
+forces static batches; you can't go lower. If a single prompt's longest
+response still doesn't fit, the only knobs are dropping the response
+length cap, dropping `tensor_model_parallel_size` (more shards), or moving
+to a bigger GPU.
+
+### Quick recipe by GPU
+
+| Situation | Stack |
+|---|---|
+| 8× B200 (180 GiB), Qwen3.5-4B, 32k–65k responses | Recompute=full, optimizer_cpu_offload=true, gpu_mem_util=0.7–0.85, async (Mode 4 for 65k) |
+| 8× H100 (80 GiB), Qwen3.5-4B, 16k responses | Recompute=full, optimizer_cpu_offload=true, gpu_mem_util=0.7, async Mode 1 (validated reference) |
+| Colocate (any GPU), Qwen3.5-4B | All of the above + `param_offload=true`, `grad_offload=true`, `optimizer_offload=true` on the trainer side |
 
 ## LLM-as-judge reward
 
@@ -334,6 +387,182 @@ Customizable extension points:
 Full guide, including dataset schema requirements and a checker
 (`python -m verl.utils.judge.check_dataset`), is in
 [`verl/utils/judge/README.md`](verl/utils/judge/README.md).
+
+## Custom rollouts
+
+Use this pattern when you want non-vanilla rollout behavior — e.g. a
+self-reflection loop where the policy generates an answer, gets a critique,
+and revises; or a multi-agent debate; or any other rollout shape that
+goes beyond a single `generate_sequences` call. The pattern keeps the
+trainer's gradient/sync machinery intact and only swaps the rollout step.
+
+### Recommended layout
+
+Put each recipe in **its own top-level package** at the same level as
+`verl/`. Each recipe is self-contained: main entry point, custom trainer,
+custom rollout class, configs, scripts.
+
+```
+verl/                              # the framework — don't fork it
+my_recipe/                         # your recipe
+  __init__.py
+  main.py                          # entry point — Hydra dispatch
+  trainer.py                       # MyRayPPOTrainer(RayPPOTrainer)
+  rollout.py                       # MyRollout — the actual custom rollout
+  config/
+    my_recipe_trainer.yaml         # extends ppo_megatron_trainer.yaml
+  scripts/
+    qwen35_4b_my_recipe.sh         # launcher
+```
+
+Why a sibling package, not a subdir of `verl/`: keeps your code separable
+from the framework, so you can rebase against upstream verl without
+conflicts.
+
+### Three pieces
+
+**1. Custom rollout class** (`my_recipe/rollout.py`).
+
+The verl trainer talks to rollouts through one method:
+`async_rollout_manager.generate_sequences(batch) -> batch`. Wrap the
+existing `AgentLoopManager` and add your custom logic around its calls.
+
+```python
+# my_recipe/rollout.py
+from verl import DataProto
+
+class MyRollout:
+    """Self-reflection rollout: generate -> critique -> revise."""
+
+    def __init__(self, base_manager, max_turns: int = 3):
+        self._base = base_manager   # the original AgentLoopManager
+        self.max_turns = max_turns
+
+    def generate_sequences(self, batch: DataProto) -> DataProto:
+        current = self._base.generate_sequences(batch)
+        for turn in range(self.max_turns - 1):
+            current = self._build_reflection_batch(batch, current)
+            current = self._base.generate_sequences(current)
+        return current
+
+    def _build_reflection_batch(self, original: DataProto, prev: DataProto) -> DataProto:
+        # Construct a follow-up prompt that includes the previous response
+        # plus a critique header. Implementation-specific.
+        ...
+
+    # Forward any other AgentLoopManager methods you need (validate path,
+    # checkpoint hooks, etc.) to self._base.
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+```
+
+**2. Custom trainer** (`my_recipe/trainer.py`).
+
+Inherit from `RayPPOTrainer` and override `fit` to point at the custom
+rollout. You can either swap the rollout manager at `init_workers` time
+(every `generate_sequences` call now goes through your wrapper) **or**
+override `fit` directly and call `MyRollout` at the rollout points
+explicitly. Pick whichever matches the shape of your change:
+
+```python
+# my_recipe/trainer.py
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from .rollout import MyRollout
+
+class MyRayPPOTrainer(RayPPOTrainer):
+    # Option A: swap the manager once, get every rollout call wrapped.
+    def init_workers(self):
+        super().init_workers()
+        max_turns = self.config.my_recipe.reflection_max_turns
+        self.async_rollout_manager = MyRollout(
+            self.async_rollout_manager, max_turns=max_turns
+        )
+
+    # Option B: override fit() if you also need to change the *order* of
+    # PPO steps (e.g. an extra phase between rollout and reward), or if
+    # you want different rollout behavior per call site (train vs val).
+    # Copy verl/trainer/ppo/ray_trainer.py:fit() and edit the rollout
+    # call(s) — the rest stays identical.
+```
+
+Option A is far less code to keep in sync with upstream — prefer it
+unless you specifically need to reorder the PPO phases.
+
+**3. Custom main module** (`my_recipe/main.py`).
+
+Mirror `verl/trainer/main_ppo.py`. The framework already accepts a
+`task_runner_class` argument to `run_ppo`; subclass `TaskRunner` and
+override `run()` to instantiate `MyRayPPOTrainer` instead of the vanilla
+`RayPPOTrainer` at the corresponding line.
+
+```python
+# my_recipe/main.py
+import hydra
+import ray
+from verl.trainer.main_ppo import run_ppo, TaskRunner
+from .trainer import MyRayPPOTrainer
+
+
+@ray.remote(num_cpus=1)
+class MyTaskRunner(TaskRunner):
+    """Same as TaskRunner but builds MyRayPPOTrainer."""
+
+    def run(self, config):
+        # Copy verl/trainer/main_ppo.py:TaskRunner.run() and replace the
+        # `trainer = RayPPOTrainer(...)` line with `trainer = MyRayPPOTrainer(...)`.
+        # Everything else (resource pool setup, dataset, sampler, init_workers,
+        # fit) stays identical.
+        ...
+
+
+@hydra.main(config_path="config", config_name="my_recipe_trainer", version_base=None)
+def main(config):
+    run_ppo(config, task_runner_class=MyTaskRunner)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**4. Config** (`my_recipe/config/my_recipe_trainer.yaml`).
+
+Inherit the base Hydra config and add recipe-specific knobs:
+
+```yaml
+defaults:
+  - /ppo_megatron_trainer    # the upstream base config
+  - _self_
+
+my_recipe:
+  reflection_max_turns: 3
+```
+
+**5. Launcher** (`my_recipe/scripts/qwen35_4b_my_recipe.sh`).
+
+Mirror the launchers in [`scripts/sample_scripts/`](scripts/sample_scripts/),
+but invoke your `main` instead of `verl.trainer.main_ppo`:
+
+```bash
+#!/usr/bin/env bash
+set -x
+# ...env setup, LD_LIBRARY_PATH, etc — copy from sample_scripts/...
+python -m my_recipe.main \
+    --config-path=$(pwd)/my_recipe/config \
+    --config-name='my_recipe_trainer.yaml' \
+    +my_recipe.reflection_max_turns=3 \
+    actor_rollout_ref.model.path="$HF_MODEL_PATH" \
+    data.train_files="$TRAIN_FILE" \
+    ... # everything else as in sample_scripts
+```
+
+### Async runs
+
+If you're running async (Mode 1/4), the entry point is
+`verl.experimental.fully_async_policy.fully_async_main` instead and you
+inherit from `FullyAsyncTrainer` (in
+`verl/experimental/fully_async_policy/fully_async_trainer.py`). The
+rollout-wrap pattern is identical — `FullyAsyncTrainer` also calls into
+the rollouter through a manager that you can swap in `init_workers`.
 
 ## Limitations
 
@@ -436,10 +665,13 @@ this reason.
 
 ## Pointers
 
-- [`ASYNC_EXPERIMENT.md`](ASYNC_EXPERIMENT.md) — async verification protocol
-  (what to watch, what to compare, how to tell if sync is broken).
-- [`docs/qwen3_4b_inst_acemath_mode1_config.md`](docs/qwen3_4b_inst_acemath_mode1_config.md) —
-  Mode 1 reference run hyperparameters.
+- [`scripts/sample_scripts/`](scripts/sample_scripts/) — portable launcher
+  templates for the validated configurations (colocate / Mode 1 / Mode 4 on
+  Qwen3-Instruct + AceMath, Qwen3.5 + DAPO Math, Qwen3.5 + Fineproofs with
+  LLM judge). Set `HF_MODEL_PATH` and `TRAIN_FILE` and run.
+- [`scripts/data/`](scripts/data/) — dataset preprocessing utilities (e.g.,
+  the Fineproofs → DAPO chat format converter that uploaded
+  [`HerrHruby/fineproofs`](https://huggingface.co/datasets/HerrHruby/fineproofs)).
 - [`verl/utils/judge/README.md`](verl/utils/judge/README.md) — LLM-as-judge
   full guide: architecture, dataset format, customization, Cloudflare hosting.
 - [`docs/advance/fully_async.md`](docs/advance/fully_async.md) — upstream's
