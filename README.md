@@ -456,6 +456,55 @@ class MyRollout:
         return getattr(self._base, name)
 ```
 
+#### What `generate_sequences` must return
+
+Return a `DataProto` (verl's `{batch, non_tensor_batch, meta_info}`
+container) with these **required** fields. The trainer reads them
+directly during reward, log-prob recompute, advantage, and update
+phases — get the shapes wrong and downstream collation breaks.
+
+`batch.batch` (a `TensorDict`):
+
+| Key | Shape | Meaning |
+|---|---|---|
+| `prompts` | `(bsz, prompt_length)` | Prompt token ids, **left-padded** (e.g., `[0,0,1,2,3,4]`). |
+| `responses` | `(bsz, response_length)` | Response token ids, **right-padded** (e.g., `[5,6,7,8,0,0]`). |
+| `input_ids` | `(bsz, prompt_length + response_length)` | Concatenation of `prompts` + `responses`. |
+| `attention_mask` | `(bsz, prompt_length + response_length)` | 1s for real tokens, 0s for padding. The prompt portion is left-padded, the response portion is right-padded. |
+| `position_ids` | `(bsz, prompt_length + response_length)` *or* `(bsz, 3, prompt_length + response_length)` for MRoPE | Incremental positions over the full sequence; padding positions are 0. |
+| `response_mask` | `(bsz, response_length)` | 1 for tokens the policy generated, 0 for tool-response tokens / padding. Optional — the trainer falls back to deriving it from `responses + attention_mask` via `compute_response_mask(batch)` if absent, but emit it yourself if you have tool turns. |
+
+**Optional fields** the trainer uses if present:
+
+| Key | Shape | When |
+|---|---|---|
+| `rollout_log_probs` | `(bsz, response_length)` | When `actor.use_rollout_log_probs=true` (fully-async default), used as `old_log_prob` for importance sampling. If absent, the trainer recomputes via the actor engine. |
+| `routed_experts` | per-expert | MoE routing replay. |
+| `teacher_logprobs`, `teacher_ids` | response_length | Distillation paths. |
+
+`batch.non_tensor_batch` should preserve at least the dataset-supplied
+fields (`data_source`, `reward_model`, `extra_info`, etc.) so the reward
+manager can read them downstream. The agent loop additionally adds:
+
+- `__num_turns__` — number of agent-loop iterations per sample.
+- `multi_modal_inputs` — only for VL data; pass through if your rollout
+  doesn't change vision tokens.
+- `raw_prompt` — chat-format messages, when `data.return_raw_chat=true`.
+
+`batch.meta_info`:
+
+- `timing` — dict of stage timings; trainer pops it into its own timing
+  log. Optional but useful.
+- `temperature` — set by the rollouter to whatever sampling temperature
+  it used; the trainer reads it for log-prob recompute.
+
+**Reference implementation:**
+`AgentLoopWorker._postprocess` in
+`verl/experimental/agent_loop/agent_loop.py` is the canonical place that
+builds this shape from raw rollout outputs. If your custom rollout
+produces token streams in any other shape, mirror its padding /
+concatenation logic.
+
 **2. Custom trainer** (`my_recipe/trainer.py`).
 
 Inherit from `RayPPOTrainer` and override `fit` to point at the custom
