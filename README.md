@@ -388,6 +388,182 @@ Full guide, including dataset schema requirements and a checker
 (`python -m verl.utils.judge.check_dataset`), is in
 [`verl/utils/judge/README.md`](verl/utils/judge/README.md).
 
+## Custom rollouts
+
+Use this pattern when you want non-vanilla rollout behavior — e.g. a
+self-reflection loop where the policy generates an answer, gets a critique,
+and revises; or a multi-agent debate; or any other rollout shape that
+goes beyond a single `generate_sequences` call. The pattern keeps the
+trainer's gradient/sync machinery intact and only swaps the rollout step.
+
+### Recommended layout
+
+Put each recipe in **its own top-level package** at the same level as
+`verl/`. Each recipe is self-contained: main entry point, custom trainer,
+custom rollout class, configs, scripts.
+
+```
+verl/                              # the framework — don't fork it
+my_recipe/                         # your recipe
+  __init__.py
+  main.py                          # entry point — Hydra dispatch
+  trainer.py                       # MyRayPPOTrainer(RayPPOTrainer)
+  rollout.py                       # MyRollout — the actual custom rollout
+  config/
+    my_recipe_trainer.yaml         # extends ppo_megatron_trainer.yaml
+  scripts/
+    qwen35_4b_my_recipe.sh         # launcher
+```
+
+Why a sibling package, not a subdir of `verl/`: keeps your code separable
+from the framework, so you can rebase against upstream verl without
+conflicts.
+
+### Three pieces
+
+**1. Custom rollout class** (`my_recipe/rollout.py`).
+
+The verl trainer talks to rollouts through one method:
+`async_rollout_manager.generate_sequences(batch) -> batch`. Wrap the
+existing `AgentLoopManager` and add your custom logic around its calls.
+
+```python
+# my_recipe/rollout.py
+from verl import DataProto
+
+class MyRollout:
+    """Self-reflection rollout: generate -> critique -> revise."""
+
+    def __init__(self, base_manager, max_turns: int = 3):
+        self._base = base_manager   # the original AgentLoopManager
+        self.max_turns = max_turns
+
+    def generate_sequences(self, batch: DataProto) -> DataProto:
+        current = self._base.generate_sequences(batch)
+        for turn in range(self.max_turns - 1):
+            current = self._build_reflection_batch(batch, current)
+            current = self._base.generate_sequences(current)
+        return current
+
+    def _build_reflection_batch(self, original: DataProto, prev: DataProto) -> DataProto:
+        # Construct a follow-up prompt that includes the previous response
+        # plus a critique header. Implementation-specific.
+        ...
+
+    # Forward any other AgentLoopManager methods you need (validate path,
+    # checkpoint hooks, etc.) to self._base.
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+```
+
+**2. Custom trainer** (`my_recipe/trainer.py`).
+
+Inherit from `RayPPOTrainer` and override `fit` to point at the custom
+rollout. You can either swap the rollout manager at `init_workers` time
+(every `generate_sequences` call now goes through your wrapper) **or**
+override `fit` directly and call `MyRollout` at the rollout points
+explicitly. Pick whichever matches the shape of your change:
+
+```python
+# my_recipe/trainer.py
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from .rollout import MyRollout
+
+class MyRayPPOTrainer(RayPPOTrainer):
+    # Option A: swap the manager once, get every rollout call wrapped.
+    def init_workers(self):
+        super().init_workers()
+        max_turns = self.config.my_recipe.reflection_max_turns
+        self.async_rollout_manager = MyRollout(
+            self.async_rollout_manager, max_turns=max_turns
+        )
+
+    # Option B: override fit() if you also need to change the *order* of
+    # PPO steps (e.g. an extra phase between rollout and reward), or if
+    # you want different rollout behavior per call site (train vs val).
+    # Copy verl/trainer/ppo/ray_trainer.py:fit() and edit the rollout
+    # call(s) — the rest stays identical.
+```
+
+Option A is far less code to keep in sync with upstream — prefer it
+unless you specifically need to reorder the PPO phases.
+
+**3. Custom main module** (`my_recipe/main.py`).
+
+Mirror `verl/trainer/main_ppo.py`. The framework already accepts a
+`task_runner_class` argument to `run_ppo`; subclass `TaskRunner` and
+override `run()` to instantiate `MyRayPPOTrainer` instead of the vanilla
+`RayPPOTrainer` at the corresponding line.
+
+```python
+# my_recipe/main.py
+import hydra
+import ray
+from verl.trainer.main_ppo import run_ppo, TaskRunner
+from .trainer import MyRayPPOTrainer
+
+
+@ray.remote(num_cpus=1)
+class MyTaskRunner(TaskRunner):
+    """Same as TaskRunner but builds MyRayPPOTrainer."""
+
+    def run(self, config):
+        # Copy verl/trainer/main_ppo.py:TaskRunner.run() and replace the
+        # `trainer = RayPPOTrainer(...)` line with `trainer = MyRayPPOTrainer(...)`.
+        # Everything else (resource pool setup, dataset, sampler, init_workers,
+        # fit) stays identical.
+        ...
+
+
+@hydra.main(config_path="config", config_name="my_recipe_trainer", version_base=None)
+def main(config):
+    run_ppo(config, task_runner_class=MyTaskRunner)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**4. Config** (`my_recipe/config/my_recipe_trainer.yaml`).
+
+Inherit the base Hydra config and add recipe-specific knobs:
+
+```yaml
+defaults:
+  - /ppo_megatron_trainer    # the upstream base config
+  - _self_
+
+my_recipe:
+  reflection_max_turns: 3
+```
+
+**5. Launcher** (`my_recipe/scripts/qwen35_4b_my_recipe.sh`).
+
+Mirror the launchers in [`scripts/sample_scripts/`](scripts/sample_scripts/),
+but invoke your `main` instead of `verl.trainer.main_ppo`:
+
+```bash
+#!/usr/bin/env bash
+set -x
+# ...env setup, LD_LIBRARY_PATH, etc — copy from sample_scripts/...
+python -m my_recipe.main \
+    --config-path=$(pwd)/my_recipe/config \
+    --config-name='my_recipe_trainer.yaml' \
+    +my_recipe.reflection_max_turns=3 \
+    actor_rollout_ref.model.path="$HF_MODEL_PATH" \
+    data.train_files="$TRAIN_FILE" \
+    ... # everything else as in sample_scripts
+```
+
+### Async runs
+
+If you're running async (Mode 1/4), the entry point is
+`verl.experimental.fully_async_policy.fully_async_main` instead and you
+inherit from `FullyAsyncTrainer` (in
+`verl/experimental/fully_async_policy/fully_async_trainer.py`). The
+rollout-wrap pattern is identical — `FullyAsyncTrainer` also calls into
+the rollouter through a manager that you can swap in `init_workers`.
+
 ## Limitations
 
 **Tested only with Megatron + vLLM.** The FSDP backend should still work but
