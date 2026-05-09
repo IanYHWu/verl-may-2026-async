@@ -235,7 +235,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
 
-            self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * 16
+            concurrency_multiplier = self.config.async_training.get("concurrency_multiplier", 16)
+            self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * concurrency_multiplier
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
 
