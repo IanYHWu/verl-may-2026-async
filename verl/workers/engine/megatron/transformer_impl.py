@@ -822,6 +822,12 @@ class MegatronEngineWithLMHead(MegatronEngine):
         batch = batch.to(get_device_id())
         use_fused_kernels = tu.get_non_tensor_data(batch, key="use_fused_kernels", default=False)
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
+        # When True, compute entropy without keeping logits in the autograd graph — the engine
+        # skips the ~vocab_size × seq_len × dtype defensive clone normally needed to avoid
+        # autograd version-counter conflicts between entropy.backward and log_prob.backward.
+        # Only safe when entropy is purely for logging (entropy_coeff=0) or when the forward
+        # is in eval/no_grad mode (compute_log_prob path).
+        entropy_no_grad = tu.get_non_tensor_data(batch, key="entropy_no_grad", default=False)
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
 
@@ -911,15 +917,30 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 if calculate_sum_pi_squared:
                     ret["sum_pi_squared"] = vocab_parallel_sum_pi_squared(logits)
                 if calculate_entropy:
-                    logits_bak = logits.clone()
-                    # # disable the hint until the fused_kernel is optimized for triton>=3.3
-                    # if torch.distributed.get_rank() == 0:
-                    #     logger.warning_once(
-                    #         "For memory-efficient computation, enable fused kernels via "
-                    #         "`actor_rollout_ref.model.use_fused_kernels=True`. "
-                    #         "The current `clone()` operation ensures correctness but increases memory usage."
-                    #     )
-                    entropy = vocab_parallel_entropy(logits)
+                    if entropy_no_grad:
+                        # Monitor-only path: no autograd through entropy → no version-counter
+                        # conflict with log_prob backward → no defensive clone of logits.
+                        # vocab_parallel_entropy.forward is non-destructive on its input, and
+                        # without autograd save_for_backward there is no in-place mutation
+                        # later. logits stays usable for log_prob below.
+                        with torch.no_grad():
+                            entropy = vocab_parallel_entropy(logits.detach())
+                        logits_bak = logits
+                    else:
+                        # Loss-contributing entropy: clone logits so log_prob.backward and
+                        # entropy.backward don't fight over the same tensor's version
+                        # counter (entropy.backward does in-place sub_/add_ on the saved
+                        # logits; even though it restores the value, the bumped version
+                        # would invalidate log_prob's saved view).
+                        # # disable the hint until the fused_kernel is optimized for triton>=3.3
+                        # if torch.distributed.get_rank() == 0:
+                        #     logger.warning_once(
+                        #         "For memory-efficient computation, enable fused kernels via "
+                        #         "`actor_rollout_ref.model.use_fused_kernels=True`. "
+                        #         "The current `clone()` operation ensures correctness but increases memory usage."
+                        #     )
+                        logits_bak = logits.clone()
+                        entropy = vocab_parallel_entropy(logits)
                     ret["entropy"] = entropy
                 else:
                     logits_bak = logits
