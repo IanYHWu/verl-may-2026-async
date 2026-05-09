@@ -1406,6 +1406,8 @@ class PPOTrainer:
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
+        # Skip the defensive logits clone when entropy is monitor-only (entropy_coeff=0).
+        entropy_no_grad = calculate_entropy and self.config.actor_rollout_ref.actor.entropy_coeff == 0.0
         distillation_use_topk = (
             self.distillation_config.distillation_loss.loss_settings.use_topk
             if is_distillation_enabled(self.config.get("distillation"))
@@ -1413,6 +1415,7 @@ class PPOTrainer:
         )
         extra_info = {
             "calculate_entropy": calculate_entropy,
+            "entropy_no_grad": entropy_no_grad,
             "distillation_use_topk": distillation_use_topk,
             "global_batch_size": ppo_mini_batch_size,
             "mini_batch_size": ppo_mini_batch_size,

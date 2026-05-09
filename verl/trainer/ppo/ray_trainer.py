@@ -1178,6 +1178,7 @@ class RayPPOTrainer:
         tu.assign_non_tensor(
             batch_td,
             calculate_entropy=True,
+            entropy_no_grad=True,  # log_prob path runs in eval mode; no backward through entropy
             calculate_sum_pi_squared=calculate_sum_pi_squared,
             compute_loss=False,
         )
@@ -1216,6 +1217,11 @@ class RayPPOTrainer:
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
+        # When entropy is computed for monitoring only (calculate_entropy=True but
+        # entropy_coeff=0), we don't need autograd to flow back through entropy. The
+        # engine can then skip the defensive logits clone (~vocab_size × seq_len × dtype
+        # bytes per micro-batch) used to avoid autograd version-counter conflicts.
+        entropy_no_grad = calculate_entropy and self.config.actor_rollout_ref.actor.entropy_coeff == 0.0
         distillation_use_topk = (
             self.distillation_config.distillation_loss.loss_settings.use_topk
             if is_distillation_enabled(self.config.get("distillation"))
@@ -1229,6 +1235,7 @@ class RayPPOTrainer:
         tu.assign_non_tensor(
             batch_td,
             calculate_entropy=calculate_entropy,
+            entropy_no_grad=entropy_no_grad,
             distillation_use_topk=distillation_use_topk,
             global_batch_size=ppo_mini_batch_size,
             mini_batch_size=ppo_mini_batch_size,
