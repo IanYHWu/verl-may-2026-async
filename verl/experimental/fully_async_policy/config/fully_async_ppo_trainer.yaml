@@ -22,6 +22,12 @@ async_training:
   # If True, LLMServerClient auto resume generation, making rollout interruption invisible to the AgentLoop.
   partial_rollout: True
 
+  # Per-replica multiplier for max in-flight rollout prompts. Effective concurrency
+  # = num_replicas * concurrency_multiplier (capped by max_required_samples).
+  # vLLM internally pages KV cache, so over-subscribing doesn't OOM — extras queue
+  # inside the engine. Bump this if rollouter is under-utilized.
+  concurrency_multiplier: 16
+
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
