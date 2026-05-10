@@ -14,7 +14,9 @@ on top of upstream:
 - **Async (decoupled trainer/rollouter) is the default for long-context RL.**
   We've validated Qwen3.5-4B on `fully_async_policy` Mode 1 (on-policy
   pipeline) and Mode 4 (async stream + partial rollout) end-to-end at 40k
-  and 65k response lengths.
+  and 65k response lengths. Throughput data — including a Mode 4 vs
+  colocate comparison on H100 and a model-size / context / concurrency
+  sweep on B200 — is in [`docs/benchmark.md`](docs/benchmark.md).
 - **LLM-as-judge reward manager.** A new `llm_judge` reward manager calls a
   hosted OpenAI-compatible chat-completions endpoint (e.g. a Cloudflare
   Worker proxying gpt-oss / qwen / Anthropic) for rubric-based grading of
@@ -151,6 +153,7 @@ verl/experimental/reward_loop/reward_manager/
   llm_judge.py              # the LLMJudgeRewardManager class
 docs/
   advance/fully_async.md    # upstream's async-training doc
+  benchmark.md              # H100 Mode 4 vs colocate, B200 Mode 4 sweep
 scripts/data/
   convert_fineproof_to_dapo.py  # parquet → DAPO chat format converter
 scripts/sample_scripts/     # portable launcher templates
