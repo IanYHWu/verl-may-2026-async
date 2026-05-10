@@ -86,16 +86,31 @@ trajectories evenly divisible by 3.)
 | 4 | 697 | 438 | 95 | 159 | 4 |
 | **avg 2-4 (steady)** | **739** | **457** | **108** | **169** | **4** |
 
-**Mode 4 4R/4T (32 prompts / round, 2 PPO updates / round):**
+**Mode 4 4R/4T (32 prompts / round, 2 PPO updates / round):** 4 full cycles
+× 4 grad updates per cycle = 16 rounds. Step number `step:N` increments per
+trainer fetch; `g` is the global grad-update counter. With
+`trigger_parameter_sync_step=4`, weights sync between cycles.
 
-| step:N | total | gen_wait | update_actor |
-|---|---|---|---|
-| 2 (cold start) | 1264 | 932 | 331 |
-| 3 | 861 | 546 | 315 |
-| 4 (best in cycle 1) | 588 | 287 | 301 |
-| 5 (post-sync) | 808 | 470 | 285 |
-| 6 | 853 | 541 | 311 |
-| **avg 3-6 (steady)** | **778** | **461** | **303** |
+| step:N | g | cycle | pos in cycle | total | gen_wait | update_actor | resp/mean |
+|---|---|---|---|---|---|---|---|
+| 2  | g1  | C1 | p1 (cold) | 1311 | 989 | 321 | 31562 |
+| 3  | g2  | C1 | p2        |  818 | 497 | 320 | 34669 |
+| 4  | g3  | C1 | p3        |  576 | 275 | 300 | 32829 |
+| 5  | g4  | C1 | p4        |  839 | 465 | 298 | 32858 |
+| 6  | g5  | C2 | p1        |  814 | 508 | 306 | 32827 |
+| 7  | g6  | C2 | p2        |  758 | 477 | 281 | 30631 |
+| 8  | g7  | C2 | p3        |  746 | 447 | 297 | 32533 |
+| 9  | g8  | C2 | p4        |  729 | 414 | 290 | 31718 |
+| 10 | g9  | C3 | p1        |  870 | 553 | 316 | 33839 |
+| 11 | g10 | C3 | p2        |  659 | 374 | ~280 | 31241 |
+| 12 | g11 | C3 | p3        |  722 | 418 | 304 | 33095 |
+| 13 | g12 | C3 | p4        |  646 | 297 | ~340 | 30067 |
+| 14 | g13 | C4 | p1        |  682 | 392 | ~285 | 30821 |
+| 15 | g14 | C4 | p2        |  895 | 559 | ~330 | 36389 |
+| 16 | g15 | C4 | p3        |  773 | 460 | ~310 | 34206 |
+| 17 | g16 | C4 | p4        |  600 | 268 | 330 | 35554 |
+| **avg cycles 2-4 (steady, n=12)** | | | | **741** | **440** | ~310 | |
+| Cycle 1 (cold-start cycle, excluded) | | | | 886 | 557 | 310 | |
 
 **Mode 4 2R/6T (30 prompts / round, 2 PPO updates / round):**
 
@@ -111,8 +126,8 @@ trajectories evenly divisible by 3.)
 | Config | gen / gen_wait | log_prob | update_actor | **s/prompt** | Notes |
 |---|---|---|---|---|---|
 | Colocate | 14.3 | 3.4 | 5.3 | **23.1** | hybrid engine, no async wait |
-| Mode 4 4R/4T (avg) | 14.4 | 0 (bypassed) | 9.5 | **24.3** | ~5% slower than colocate on avg |
-| Mode 4 4R/4T (best step) | 9.0 | 0 | 9.4 | **18.4** | 26% faster than colocate when pipeline is fully primed |
+| Mode 4 4R/4T (cycles 2-4 avg, n=12) | 13.7 | 0 (bypassed) | 9.7 | **23.2** | tied with colocate within 1% |
+| Mode 4 4R/4T (cycle-end position avg, n=3) | 8.3 | 0 | 9.5 | **20.6** | best position in cycle (p4) |
 | Mode 4 2R/6T (avg) | 46.7 | 0 | 6.7 | **53.4** | rollout-starved by 2-GPU vLLM |
 
 End-to-end throughput (prompts / sec):
@@ -120,9 +135,33 @@ End-to-end throughput (prompts / sec):
 | Config | prompts/s | vs colocate |
 |---|---|---|
 | Colocate | 0.0433 | 1.00× |
-| Mode 4 4R/4T avg | 0.0411 | 0.95× (5% slower) |
-| Mode 4 4R/4T best step | 0.0544 | 1.26× (faster) |
-| Mode 4 2R/6T avg | 0.0187 | 0.43× (2.3× slower) |
+| Mode 4 4R/4T (cycles 2-4 avg) | 0.0432 | 1.00× (tied) |
+| Mode 4 4R/4T (best cycle position p4) | 0.0486 | 1.12× (faster) |
+| Mode 4 2R/6T (avg) | 0.0187 | 0.43× (2.3× slower) |
+
+### Within-cycle position pattern
+
+Averaging across cycles 2-4 (cycle 1 excluded as cold-start), step time
+**decreases monotonically** through each 4-round cycle:
+
+| Position in cycle | step time avg (n=3) | gen_wait avg | Notes |
+|---|---|---|---|
+| p1 (post-sync, first round of cycle) | **789** | 484 | weight sync drained the rollout queue |
+| p2 | 771 | 470 | queue refilling |
+| p3 | 747 | 413 | queue near-full |
+| p4 (cycle end, last round before next sync) | **659** | 360 | queue most-saturated |
+
+p1 → p4 is a 17% drop in step time. The driver is `gen_wait`: every weight
+sync momentarily idles the rollouter (it has to receive new weights from
+the trainer), and pending samples generated under stale weights may be
+dropped depending on `staleness_threshold`. The trainer's first post-sync
+fetch therefore waits on a near-empty queue, then catches up over the cycle.
+
+(Cycle 1 is anomalous: g1=1311s because the rollout pool started cold —
+queue fully empty, not just sync-drained. This makes cycle 1's middle
+rounds look like a "U-curve" with g3 being lowest, but with multi-cycle
+data the actual pattern is monotonic decrease, with **p4 the best
+position consistently**, not p3.)
 
 ### Per fwd-bwd consistency check
 
@@ -134,34 +173,36 @@ be roughly constant across configs:
 | Config | update_actor (s) | DP | Prompts per DP per round | Per-fwd-bwd (s) |
 |---|---|---|---|---|
 | Colocate | 169 | 4 | 8 | **21.1** |
-| Mode 4 4R/4T | 303 | 2 | 16 | **18.9** |
+| Mode 4 4R/4T (16-step avg) | ~310 | 2 | 16 | **19.4** |
 | Mode 4 2R/6T | 192 | 3 | 10 | **19.2** |
 
 All three land at ~19–21 s/fwd-bwd, confirming the update-time
 differences are explained entirely by fwd-bwd count per DP rank, not by
 per-call efficiency.
 
-### Why Mode 4 doesn't beat colocate by much at H100 / 4B / 32-prompt round
+### Why Mode 4 ties with colocate at H100 / 4B / 32-prompt round
 
 1. **Update side**: Mode 4 4R/4T gets only 4 trainer GPUs vs colocate's 8,
-   so DP=2 vs DP=4. Update time is roughly 2× per round (303 s vs 169 s),
-   which adds 4.2 s/prompt to Mode 4's bill. On B200, update_actor is
-   smaller and gen_wait dominates more, so the trade is more favourable.
+   so DP=2 vs DP=4. Update time is roughly 2× per round (310 s vs 169 s),
+   which adds ~4 s/prompt to Mode 4's bill. On B200, update_actor is a
+   smaller fraction of step time and gen_wait dominates more, so the trade
+   is more favourable.
 2. **Rollout side is roughly tied per-prompt**. Mode 4's 4 dedicated
-   rollout GPUs (gen_wait 14.4 s/prompt) about-match colocate's 8 shared
+   rollout GPUs (gen_wait 13.7 s/prompt) about-match colocate's 8 shared
    GPUs (gen 14.3 s/prompt). On the colocate side, vLLM benefits from 8
    GPUs but pays for memory pressure (gpu_memory_utilization=0.7 of a
    GPU also holding Megatron) and sleep/wake overhead between phases.
-3. **Cycle averaging penalises Mode 4**. With `trigger_parameter_sync_step=4`,
-   every 4 rounds the rollouter is paused for weight sync. Step 5 (first
-   post-sync round) reliably lands ~30–40% slower than the cycle-end
-   step 4 because the queue was drained. On a 2-cycle run (`N_CYCLES=2`,
-   8 rounds total), this penalty has fewer rounds to amortize over than
-   the B200 study's 4–6 cycles.
+3. **Cycle position dominates within-run variance**. With
+   `trigger_parameter_sync_step=4`, every 4 rounds the rollouter is
+   paused for weight sync. The first post-sync round (p1) reliably lands
+   ~20% slower than the cycle-end round (p4) because the queue was
+   drained. Across 4 cycles the per-cycle averages (excluding cold start)
+   are 762, 724, 738 — within ~5% of each other, so once you average
+   over a full cycle the position effect washes out.
 4. **2R/6T is wrong for this workload.** Two vLLM GPUs serve a single
    TP=2 replica, so concurrent in-flight rollouts are capped low; trainer
    wait absolutely dominates (46.7 s/prompt). The 6-trainer-GPU benefit
-   (DP=3 → fewer fwd-bwds per rank → 6.7 s/prompt update vs 9.5 in 4R/4T)
+   (DP=3 → fewer fwd-bwds per rank → 6.7 s/prompt update vs 9.7 in 4R/4T)
    is small comfort when the trainer sits idle most of the round.
 
 ### H100 vs B200 — same experiment
@@ -173,26 +214,27 @@ For the corresponding experiment in the B200 study (4B, Acemath, 40k,
 |---|---|---|---|---|---|---|---|
 | **B200** (8× SM100) | Mode 4 4T/4R, mbsz=32, req=1 | 32 | 68 | 60 | 165 | 290 | **9.1** |
 | **B200** | Mode 4 4T/4R, mbsz=32, req=2 (bsz=64) | 64 | ~150 | ~120 | ~330 | ~580 | **9.1** |
-| **H100** (8× SM90) | Mode 4 4R/4T, mbsz=16, req=2 (bsz=32) | 32 | 461 | 0 (bypass) | 303 | 778 | **24.3** |
+| **H100** (8× SM90) | Mode 4 4R/4T, mbsz=16, req=2 (bsz=32), 4 cycles | 32 | 440 | 0 (bypass) | ~310 | 741 | **23.2** |
 | **H100** | Colocate, bsz=32, mbsz=16 | 32 | 457 | 108 | 169 | 739 | **23.1** |
 
-H100 is **~2.7× slower per prompt** than B200 on the same Mode 4 4R/4T
+H100 is **~2.5× slower per prompt** than B200 on the same Mode 4 4R/4T
 4B/40k workload. The split of the gap:
-- update_actor: 303 s vs 165 s → 1.8× slower on H100 (sm90 vs sm100,
+- update_actor: 310 s vs 165 s → 1.9× slower on H100 (sm90 vs sm100,
   smaller HBM bandwidth, fewer FP8 / MXFP4 paths exercised at bf16).
-- gen_wait: 461 s vs 68 s → 6.8× slower on H100. This is the dominant
-  factor and it's primarily a vLLM-throughput gap on the rollouter side
-  combined with the cycle-sync penalty (the H100 run was 2 cycles
-  averaging over post-sync recovery; the B200 run averaged over 4+).
+- gen_wait: 440 s vs 68 s → 6.5× slower on H100. This is the dominant
+  factor and it's primarily a vLLM-throughput gap on the rollouter side.
+  The B200 study used `concurrency_multiplier=128` for these numbers; the
+  H100 run uses the default (16) so vLLM ran fewer in-flight prompts —
+  some of the gen_wait gap will close at higher concurrency.
 - The B200 study has no colocate baseline to compare against; on H100,
-  colocate and Mode 4 are within 5%.
+  colocate and Mode 4 land within 1% of each other.
 
 This is consistent with the broader pattern: at smaller models / shorter
 contexts on slower hardware, the rollouter rate limits Mode 4 hard, so
-gen-hiding only kicks in transiently (best step on H100 4R/4T was 18.4
-s/prompt — within 2× of B200). At larger models / longer contexts, the
-ratio compresses because trainer compute grows fast enough to give the
-rollouter slack.
+gen-hiding only partially works (cycle-end position p4 on H100 4R/4T
+averages 20.6 s/prompt — within ~2.3× of B200). At larger models /
+longer contexts, the ratio compresses because trainer compute grows
+fast enough to give the rollouter slack.
 
 ---
 
