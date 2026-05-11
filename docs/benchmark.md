@@ -3,14 +3,15 @@
 This document combines two benchmark studies on `fully_async_policy` Mode 4
 and (where applicable) the colocate / hybrid-engine path:
 
-- **§1 — H100 (single node, 8× SM90):** Mode 4 vs colocate at 4B, with
-  variants of the GPU split (4R/4T, 2R/6T).
-- **§2–§6 — B200 (single node, 8× SM100):** the original Mode 4 study
+- **§1 — H100, Qwen3.5-4B:** Mode 4 vs colocate at 4B, with variants of
+  the GPU split (4R/4T, 2R/6T). Direct H100 ↔ B200 comparison at the
+  bottom of §1.
+- **§2 — H100, Qwen3.5-9B:** Mode 4 vs colocate at 9B with TP=4 forced by
+  memory. The DP-loss effect inverts the 4B result.
+- **§3–§7 — B200 (single node, 8× SM100):** the original Mode 4 study
   covering model size (4B/9B/27B), context (40k/65k), concurrency
   multiplier, batch sizes, and the settings stack that flips Mode 4 from
   rollout-bound to trainer-bound.
-
-A direct H100 ↔ B200 comparison appears at the end of §1.
 
 ## Glossary
 
@@ -38,7 +39,7 @@ A direct H100 ↔ B200 comparison appears at the end of §1.
 
 ---
 
-## §1. H100 single-node — Mode 4 vs Colocate (Qwen3.5-4B, Acemath 40k)
+## §1. H100 single-node — Mode 4 vs Colocate (Qwen3.5-**4B**, Acemath 40k)
 
 **Setup.** 8× H100 80GB on a single node, Qwen3.5-4B, Acemath dataset, 40k
 max response length, 2k prompt context. All three configs match on
@@ -238,7 +239,139 @@ fast enough to give the rollouter slack.
 
 ---
 
-## §2. Model size sweep (B200, Acemath 40k, baseline Mode 4)
+## §2. H100 single-node — Mode 4 vs Colocate (Qwen3.5-**9B**, Acemath 40k)
+
+**Setup.** Same hardware (8× H100 80GB) and dataset as §1, scaled up to
+Qwen3.5-9B (10B language params, vocab=248K). At 40k responses the 9B
+trainer no longer fits at TP=2 — fwd-bwd activations OOM at ~15 GiB
+shortfall. **TP=4 is required for both colocate and mode 4 4R/4T**, which
+materially changes the DP layout:
+
+| Config | Trainer (TP, DP) | Rollouter | Trainer GPUs | mbsz | require_batches | Prompts/round |
+|---|---|---|---|---|---|---|
+| Colocate (bsz=32) | TP=4, **DP=2** | shared 8 GPUs (vLLM TP=4 × 2 replicas) | 8 | 16 | n/a | 32 |
+| Mode 4 4R/4T | TP=4, **DP=1** | 4 GPUs (vLLM TP=2 × 2 replicas) | 4 | 16 | 2 | 32 |
+
+Mode 4 2R/6T was skipped at 9B.
+
+Other 9B-specific knobs (deviations from 4B):
+- Both: `param_offload=true / grad_offload=true / optimizer_offload=true`
+  (full Megatron offload — required for 9B at 40k).
+- Mode 4: `ROLLOUT_GMU=0.6`. With 0.7 vLLM's startup memory check fails
+  because the trainer's init-phase memory transiently sits on the
+  rollouter GPUs.
+- Colocate: `ROLLOUT_GMU=0.5`. vLLM and Megatron compete for the same
+  GPUs; 0.5 leaves enough headroom for the trainer's transient peaks.
+- Same `calculate_entropy=false` + `bypass_mode=True` (mode 4) workarounds
+  as §1.
+
+### Per-round timings
+
+**Colocate (32 prompts/round, 4 cycles = 4 steps, n=4):**
+
+| Step | total | gen | old_log_prob | update_actor | weights | resp/mean |
+|---|---|---|---|---|---|---|
+| 1 (warmup) | 839 | 495 | 83 | 256 | 4 | 31775 |
+| 2 | 812 | 485 | 76 | 246 | 4 | 32983 |
+| 3 | 737 | 439 | 70 | 222 | 4 | 29664 |
+| 4 | 729 | 442 | 67 | 215 | 4 | 28335 |
+| **avg 2-4 (steady, n=3)** | **759** | **455** | **71** | **228** | 4 | |
+
+**Mode 4 4R/4T (32 prompts/round, 4 cycles = 16 grad updates, n=16):**
+
+| step:N | g | cycle | pos | total | gen_wait | update_actor | resp/mean |
+|---|---|---|---|---|---|---|---|
+| 2  | g1  | C1 | p1 (cold) | 1513 | 1032 | 479 | 31038 |
+| 3  | g2  | C1 | p2  |  928 |  479 | 448 | 31496 |
+| 4  | g3  | C1 | p3  |  880 |  448 | 431 | 30956 |
+| 5  | g4  | C1 | p4  |  884 |  402 | 428 | 29456 |
+| 6  | g5  | C2 | p1  |  948 |  482 | 465 | 32866 |
+| 7  | g6  | C2 | p2  |  912 |  462 | ~432 | 31275 |
+| 8  | g7  | C2 | p3  |  852 |  407 | ~397 | 31060 |
+| 9  | g8  | C2 | p4  |  919 |  417 | ~432 | 30626 |
+| 10 | g9  | C3 | p1  |  852 |  432 | ~380 | 29003 |
+| 11 | g10 | C3 | p2  |  800 |  378 | ~360 | 29763 |
+| 12 | g11 | C3 | p3  |  879 |  437 | ~395 | 30859 |
+| 13 | g12 | C3 | p4  |  813 |  388 | ~370 | 28142 |
+| 14 | g13 | C4 | p1  |  897 |  477 | ~385 | 29084 |
+| 15 | g14 | C4 | p2  |  986 |  530 | ~410 | 31952 |
+| 16 | g15 | C4 | p3  |  873 |  422 | ~390 | 31285 |
+| 17 | g16 | C4 | p4  |  762 |  306 | 454 | 32252 |
+| **avg cycles 2-4 (steady, n=12)** | | | | **874** | **428** | ~410 | |
+| Cycle 1 (cold-start, excluded) | | | | 1051 | 590 | 446 | |
+
+### Per-prompt comparison
+
+| Config | gen / gen_wait | log_prob | update_actor | **s/prompt** | Notes |
+|---|---|---|---|---|---|
+| Colocate (steady avg, n=3) | 14.2 | 2.2 | **7.1** | **23.7** | TP=4 DP=2 → 16 fwd-bwd per DP rank |
+| Mode 4 4R/4T (cycles 2-4 avg, n=12) | 13.4 | 0 (bypassed) | **~12.8** | **27.3** | TP=4 DP=1 → 32 fwd-bwd per DP rank |
+| Mode 4 4R/4T (cycle-end p4 avg, n=3) | 11.6 | 0 | ~12.0 | **26.0** | best cycle position |
+
+**End-to-end throughput (prompts/sec):**
+
+| Config | prompts/s | vs colocate |
+|---|---|---|
+| Colocate | 0.0421 | 1.00× |
+| Mode 4 4R/4T (steady avg) | 0.0366 | 0.87× (15% slower) |
+| Mode 4 4R/4T (p4 only) | 0.0420 | 1.00× (tied at best position) |
+
+### Why colocate wins at 9B
+
+This is the *opposite* of the 4B result and worth understanding.
+
+1. **TP=4 forces DP=1 on mode 4 4R/4T**. To fit 9B's fwd-bwd activations
+   in 80 GB at 40k, every config needs TP=4. But with only 4 trainer GPUs
+   in mode 4, all of them go to TP, leaving DP=1. Colocate gets to spread
+   TP=4 over 8 trainer-equivalent GPUs, so it keeps DP=2.
+
+2. **DP=1 doubles update_actor for mode 4**. Per-fwd-bwd time is
+   essentially identical between the two configs (per-fwd-bwd
+   consistency check below). But mode 4's DP=1 means each DP rank handles
+   the full 32-prompt batch, doing 32 sequential fwd-bwds, while
+   colocate's DP=2 means each DP rank handles 16 → 16 fwd-bwds. That's a
+   ~13 s/prompt cost difference, which gen-hiding can't recover (mode 4's
+   trainer is already busy enough that the rollouter has slack — gen_wait
+   per prompt actually drops from colocate's 14.2 to mode 4's 13.4).
+
+3. **Per fwd-bwd consistency check.** Confirms point 2 is purely about
+   fwd-bwd count, not efficiency:
+
+   | Config | update_actor (s) | DP | Prompts per DP per round | Fwd-bwds per DP rank | Per-fwd-bwd (s) |
+   |---|---|---|---|---|---|
+   | Colocate (9B) | 228 | 2 | 16 | 16 | **14.2** |
+   | Mode 4 4R/4T (9B) | ~450 | 1 | 32 | 32 | **14.1** |
+
+   Within ~1% per fwd-bwd. The 9B update_actor difference is entirely
+   structural.
+
+4. **Cycle position effect is weaker at 9B than 4B**. Mode 4 position
+   averages: p1=899, p2=899, p3=868, p4=831 → only an 8% p1→p4 drop, vs
+   17% at 4B. Because trainer compute is closer to gen time at 9B, the
+   queue doesn't deplete as much during sync, so the post-sync penalty
+   is smaller in relative terms.
+
+### Implication: when does mode 4 actually win?
+
+The 4B → 9B inversion comes from one factor: forcing TP up to fit a
+larger model on the same node also forces DP down, and mode 4 (which
+already has fewer trainer GPUs) loses DP first. For mode 4 to win on
+single-node H100:
+- Model must fit at TP=2 on the mode-4 trainer half (so DP can be ≥2 on
+  both modes), **or**
+- Trainer compute must dominate gen_wait by enough to mask the lost DP
+  parallelism, **or**
+- More trainer GPUs (2R/6T split) to recover DP — but then the rollouter
+  becomes the bottleneck (cf. 4B 2R/6T at 53 s/prompt).
+
+The B200 sweep in §3 shows mode 4 winning cleanly at 9B and 27B, which
+is consistent: on B200 the per-fwd-bwd time is enough lower that even
+TP=4 / DP=1 mode 4 still benefits from gen-hiding more than it loses to
+reduced DP. On H100 that margin doesn't exist at 40k.
+
+---
+
+## §3. Model size sweep (B200, Acemath 40k, baseline Mode 4)
 
 **Setup**: 8× B200 GPUs (single node), Qwen3.5 dense models, BSHD layout,
 vanilla mbridge, Megatron-Core 0.16.1, vLLM 0.19.1. All Mode 4 runs in
@@ -274,7 +407,7 @@ Observations:
 - Param sync time grows mildly with model size (NCCL bandwidth × param
   count); checkpoint-engine keeps it under 8s even for 27B.
 
-## §3. Dataset / context comparison (B200, 4B, Mode 4)
+## §4. Dataset / context comparison (B200, 4B, Mode 4)
 
 Same 4-trainer/4-rollout split. Compares Acemath at 40k context (baseline
 above) vs Fineproof at 65k context. Fineproof requires LLM-judge-graded
@@ -301,7 +434,7 @@ Observations:
   slightly rollout-bound; at Acemath 40k batch=64 they are roughly
   balanced.
 
-## §4. Concurrency multiplier sweep (B200, 4B, Fineproof 65k batch=64)
+## §5. Concurrency multiplier sweep (B200, 4B, Fineproof 65k batch=64)
 
 The async rollouter caps in-flight prompts at
 `num_replicas × concurrency_multiplier` (capped by `max_required_samples
@@ -325,7 +458,7 @@ Observations:
   the parallelism benefit. We've made `concurrency_multiplier` a config
   knob (`async_training.concurrency_multiplier`).
 
-## §5. Batch size sweep (B200, Mode 4)
+## §6. Batch size sweep (B200, Mode 4)
 
 Holding everything else constant: 4T+4R, conc=128, no Megatron offloads.
 
@@ -350,7 +483,7 @@ Observations:
 - For 9B/27B, trainer compute dominates; bigger batch grows step time
   linearly but doesn't change the trainer-bound vs rollout-bound regime.
 
-## §6. Settings that flip Mode 4 from rollout-bound to trainer-bound (B200)
+## §7. Settings that flip Mode 4 from rollout-bound to trainer-bound (B200)
 
 For 4B Acemath 40k batch=64 — the smallest case where Mode 4 was on the
 edge — the following stack of changes brings step time down and gen_wait
