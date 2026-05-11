@@ -105,7 +105,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.actor.calculate_entropy=true \
+    actor_rollout_ref.actor.calculate_entropy=${CALC_ENTROPY:-true} \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=1 \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${TP} \
