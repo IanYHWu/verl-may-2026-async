@@ -19,30 +19,47 @@ import modelopt.torch.quantization as mtq
 import torch.nn as nn
 from modelopt.torch.quantization.config import _default_disabled_quantizer_cfg
 
-_NVFP4_W4A16_QUANTIZER_CFG = {
-    "*weight_quantizer": {
-        "num_bits": (2, 1),
-        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-        "axis": None,
+_NVFP4_W4A16_QUANT_CFG_ENTRIES = [
+    {
+        "quantizer_name": "*weight_quantizer",
+        "cfg": {
+            "num_bits": (2, 1),
+            "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+            "axis": None,
+        },
         "enable": True,
     },
-    "*input_quantizer": {"enable": False},
-}
+    {"quantizer_name": "*input_quantizer", "enable": False},
+]
 
 
-def _ignore_patterns_to_quant_cfg(ignore_patterns: list[str]) -> dict:
-    cfg = {}
+def _ignore_patterns_to_quant_cfg(ignore_patterns: list[str]) -> list[dict]:
     mapping = {
         "lm_head": "*output_layer*",
         "*mlp.gate": "*router*",
         "*self_attn*": "*self_attention*",
     }
+    entries = []
     for pattern in ignore_patterns:
-        key = pattern
-        if key in mapping:
-            key = mapping[key]
-        cfg[key] = {"enable": False}
-    return cfg
+        key = mapping.get(pattern, pattern)
+        entries.append({"quantizer_name": key, "enable": False})
+    return entries
+
+
+def _normalize_default_disabled_cfg() -> list[dict]:
+    """Return modelopt's default-disabled quantizer config as a list of entries.
+
+    Newer modelopt (>=0.39) exposes it as a list of dicts directly. Older
+    releases used a dict {pattern: {"enable": False}} mapping. Accept both.
+    """
+    if isinstance(_default_disabled_quantizer_cfg, list):
+        return list(_default_disabled_quantizer_cfg)
+    if isinstance(_default_disabled_quantizer_cfg, dict):
+        return [
+            {"quantizer_name": name, **(spec if isinstance(spec, dict) else {})}
+            for name, spec in _default_disabled_quantizer_cfg.items()
+        ]
+    return []
 
 
 def build_quantize_config(
@@ -56,13 +73,13 @@ def build_quantize_config(
     if ignore_patterns is None:
         ignore_patterns = []
 
-    ignore_cfg = _ignore_patterns_to_quant_cfg(ignore_patterns)
+    ignore_entries = _ignore_patterns_to_quant_cfg(ignore_patterns)
 
-    quant_cfg = {
-        **_NVFP4_W4A16_QUANTIZER_CFG,
-        **_default_disabled_quantizer_cfg,
-        **ignore_cfg,
-    }
+    quant_cfg = (
+        _NVFP4_W4A16_QUANT_CFG_ENTRIES
+        + _normalize_default_disabled_cfg()
+        + ignore_entries
+    )
     return {"quant_cfg": quant_cfg, "algorithm": "max"}
 
 

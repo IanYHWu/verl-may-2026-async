@@ -263,23 +263,42 @@ def _modelopt_dense_process_weights(self, layer: torch.nn.Module) -> None:
         group_size=group_size,
     )
     marlin_weight_scale = nvfp4_marlin_process_scales(weight_scale)
+    # vLLM >=0.19 returns (tensor, scale_factor) — keep only the tensor.
+    if isinstance(marlin_weight_scale, tuple):
+        marlin_weight_scale = marlin_weight_scale[0]
     marlin_weight_scale_2 = nvfp4_marlin_process_global_scale(weight_scale_2_max.to(param_dtype))
+
+    # vLLM 0.19+: apply_nvfp4_linear / apply_fp4_marlin_linear read
+    # weight_global_scale (float32 scalar), input_global_scale_inv, and alpha.
+    # For W4A16 (no input quant) we synthesize neutral input_scale = 1.0.
+    weight_global_scale = weight_scale_2_max  # float32 scalar
+    one = torch.ones((), dtype=torch.float32, device=device)
+    alpha = weight_global_scale.clone()  # input_global_scale=1 * weight_global_scale
 
     if is_first_call:
         layer.weight = Parameter(marlin_weight, requires_grad=False)
         layer.weight_scale = Parameter(marlin_weight_scale, requires_grad=False)
         layer.weight_scale_2 = Parameter(marlin_weight_scale_2, requires_grad=False)
+        layer.weight_global_scale = Parameter(weight_global_scale.clone(), requires_grad=False)
+        layer.input_global_scale_inv = Parameter(one.clone(), requires_grad=False)
+        layer.alpha = Parameter(alpha.clone(), requires_grad=False)
         layer._marlin_tensor_refs = {
             "weight": layer.weight.data,
             "weight_scale": layer.weight_scale.data,
             "weight_scale_2": layer.weight_scale_2.data,
+            "weight_global_scale": layer.weight_global_scale.data,
+            "input_global_scale_inv": layer.input_global_scale_inv.data,
+            "alpha": layer.alpha.data,
         }
     else:
         _update_ref_or_create(layer, "weight", marlin_weight)
         _update_ref_or_create(layer, "weight_scale", marlin_weight_scale)
         _update_ref_or_create(layer, "weight_scale_2", marlin_weight_scale_2)
+        _update_ref_or_create(layer, "weight_global_scale", weight_global_scale)
+        _update_ref_or_create(layer, "input_global_scale_inv", one)
+        _update_ref_or_create(layer, "alpha", alpha)
 
-    for attr in ["input_scale", "alpha", "input_scale_inv"]:
+    for attr in ["input_scale", "input_scale_inv"]:
         if hasattr(layer, attr):
             delattr(layer, attr)
 
@@ -310,7 +329,10 @@ def _marlin_process_scales_experts(scale_hf, param_dtype, size_k, size_n, group_
     scales = scale_hf.to(param_dtype)
     for i in range(num_experts):
         s = marlin_permute_scales(s=scales[i].T, size_k=size_k, size_n=size_n, group_size=group_size)
-        result.append(nvfp4_marlin_process_scales(s))
+        processed = nvfp4_marlin_process_scales(s)
+        if isinstance(processed, tuple):
+            processed = processed[0]
+        result.append(processed)
     return torch.stack(result)
 
 
