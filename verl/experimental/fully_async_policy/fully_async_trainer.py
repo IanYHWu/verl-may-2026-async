@@ -867,3 +867,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             for key, value in batch.meta_info.items():
                 if key.startswith("fully_async") or key.startswith("timing_s"):
                     metrics[key] = value
+                    # Parity with the colocate trainer: custom rollout-status groups
+                    # (flat_rollout/*, response_length/*) are emitted by the manager
+                    # without the fully_async/ prefix in colocate. assemble_batch_from_
+                    # rollout_samples prepends "fully_async/" to every rollout_status
+                    # key, which buries them under the fully_async wandb section. Mirror
+                    # those two groups back to top-level so both run modes share panels.
+                    for grp in ("fully_async/flat_rollout/", "fully_async/response_length/"):
+                        if key.startswith(grp):
+                            metrics[key[len("fully_async/"):]] = value
