@@ -788,4 +788,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "static/max_concurrent_samples": self.max_concurrent_samples,
         }
 
+        # Surface metrics from a custom rollout manager (e.g. per-step recipe stats:
+        # termination distribution, reward, response lengths) so they reach wandb via
+        # rollout_status. Generic: any manager exposing rollout_metrics() -> dict
+        # participates; the stock FullyAsyncAgentLoopManager doesn't, so this is a no-op
+        # for default runs.
+        mgr = getattr(self, "async_rollout_manager", None)
+        if mgr is not None and hasattr(mgr, "rollout_metrics"):
+            try:
+                stats.update(mgr.rollout_metrics())
+            except Exception as exc:  # noqa: BLE001 — metrics must never break rollout
+                print(f"[FullyAsyncRollouter] rollout_metrics() failed: {exc}", flush=True)
+
         return stats
