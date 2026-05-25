@@ -652,24 +652,31 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # Wait for rollouter validation result and log
         val_metrics: ValidateMetrics = await asyncio.wrap_future(val_future.future())
+        # Log val on the SAME wandb step axis as the train metrics. The train series
+        # advances `step` by self.global_steps (≈ trigger * current_param_version), so
+        # logging val at step=current_param_version is a BACKWARD step (e.g. 15 vs the
+        # current ~30) -> wandb silently drops non-monotonic logs and val never appears.
+        # global_steps+1 is the step _fit_postprocess_step/_fit_update_weights use for
+        # this same fit_step, so val rides on the matching train point.
+        val_step = self.global_steps + 1
         if train_val_metrics:
             # Merge trainer and rollouter validation results
             with marked_timer("timing_s/merge_val", self.timing_raw):
                 new_metrics = self._merge_validation_results(train_val_metrics, val_metrics.metrics)
             if new_metrics:
-                self.logger.log(data=new_metrics, step=self.current_param_version)
+                self.logger.log(data=new_metrics, step=val_step)
                 pprint(
                     f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
                     f"Validation metrics: {new_metrics}, timing: {self.timing_raw['timing_s/merge_val']}"
                 )
         else:
             if val_metrics.metrics:
-                self.logger.log(data=val_metrics.metrics, step=self.current_param_version)
+                self.logger.log(data=val_metrics.metrics, step=val_step)
                 pprint(
                     f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
                     f"Validation metrics: {val_metrics.metrics}"
                 )
-        self.logger.log(data=val_metrics.timing_raw, step=self.current_param_version)
+        self.logger.log(data=val_metrics.timing_raw, step=val_step)
 
         # Merge and log validation generations from rollouter (and trainer if applicable)
         generations_to_log = self.config.trainer.log_val_generations
