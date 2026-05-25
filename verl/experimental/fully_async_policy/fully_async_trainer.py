@@ -482,6 +482,38 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             if batch is None:
                 raise TrainingStopException("Training terminated: queue returned None")
             self._collect_metrics_from_samples(batch, metrics)
+            # The collected batch may not be a multiple of the actor's sequence-level
+            # mini-batch (ppo_mini_batch_size * n) when the rollout produces a variable
+            # number of rows per sample (e.g. per-step / multi-row agent recipes). Pad
+            # to a clean multiple and mask the pad rows out of the gradient so the
+            # mini-batch split is valid. No-op when already divisible.
+            import torch as _torch
+
+            from verl.protocol import pad_dataproto_to_divisor
+
+            n = self.config.actor_rollout_ref.rollout.n
+            ppo_mini = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            divisor = max(self.actor_wg.world_size, ppo_mini * n)
+            if len(batch) % divisor != 0:
+                orig_size = len(batch)
+                # pad_dataproto_to_divisor concats slices, and DataProto.concat asserts
+                # meta_info[k] == v per key — which raises on array-valued meta_info
+                # (e.g. trajectory_param_versions). meta_info is batch-level and already
+                # consumed by _collect_metrics_from_samples above, so clear it across the
+                # pad, then restore it and recompute the per-row global_token_num.
+                saved_meta = batch.meta_info
+                batch.meta_info = {}
+                batch, pad_size = pad_dataproto_to_divisor(batch, divisor)
+                batch.meta_info = saved_meta
+                if "response_mask" in batch.batch:
+                    batch.batch["response_mask"][orig_size:] = 0
+                for _k in ("rm_scores", "token_level_rewards", "token_level_scores", "advantages"):
+                    if _k in batch.batch:
+                        batch.batch[_k][orig_size:] = 0
+                if "attention_mask" in batch.batch:
+                    batch.meta_info["global_token_num"] = _torch.sum(
+                        batch.batch["attention_mask"], dim=-1).tolist()
+                metrics["fully_async/batch_pad_rows"] = float(pad_size)
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         return batch
 
