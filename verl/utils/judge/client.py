@@ -46,6 +46,7 @@ class JudgeClient:
         max_retries: int = 3,
         retry_backoff_s: float = 2.0,
         max_concurrency: int = 32,
+        max_tokens_param: str = "max_tokens",
     ):
         if not endpoint_url:
             raise ValueError("endpoint_url is required")
@@ -54,6 +55,10 @@ class JudgeClient:
 
         self.endpoint_url = endpoint_url
         self.model = model
+        # OpenAI reasoning models (o-series / gpt-5-*) require "max_completion_tokens"
+        # and reject "max_tokens"; vLLM/gpt-oss use "max_tokens". Configurable so one
+        # client class serves both. Default keeps the legacy "max_tokens" behaviour.
+        self.max_tokens_param = max_tokens_param
         self.timeout_s = timeout_s
         self.max_retries = max_retries
         self.retry_backoff_s = retry_backoff_s
@@ -99,10 +104,14 @@ class JudgeClient:
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
+            self.max_tokens_param: max_tokens,
         }
+        # Reasoning models (OpenAI o-series / gpt-5-*) only accept the default
+        # temperature/top_p and 400 otherwise — pass None to omit them.
+        if temperature is not None:
+            body["temperature"] = temperature
+        if top_p is not None:
+            body["top_p"] = top_p
 
         # gpt-oss-style reasoning effort (low/medium/high). Pass-through.
         if reasoning_effort is not None:
