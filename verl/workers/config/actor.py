@@ -111,6 +111,12 @@ class ActorConfig(BaseConfig):
         ppo_micro_batch_size (Optional[int]): Micro-batch size for PPO training.
             If None, uses ppo_micro_batch_size_per_gpu.
         ppo_micro_batch_size_per_gpu (Optional[int]): Micro-batch size per GPU for PPO training.
+        train_minibatch_rows (Optional[int]): Explicit row-level optimizer mini-batch size
+            (in sequences/rows). If set, overrides ``ppo_mini_batch_size * rollout.n`` as the
+            per-update chunk size. Intended for flat/multi-row recipes where ppo_mini_batch_size
+            also governs how many groups are collected, so it cannot independently control the
+            number of optimizer steps per train step. Must be a positive multiple of the actor
+            data-parallel size. If None, uses the historical ``ppo_mini_batch_size * rollout.n``.
         use_dynamic_bsz (bool): Whether to use dynamic batch sizing.
         ppo_max_token_len_per_gpu (int): Maximum token length per GPU for PPO training.
         clip_ratio (float): PPO clipping ratio for policy loss.
@@ -151,6 +157,7 @@ class ActorConfig(BaseConfig):
     ppo_micro_batch_size: Optional[int] = None  # deprecate
     ppo_micro_batch_size_per_gpu: Optional[int] = None
     ppo_infer_micro_batch_size_per_gpu: Optional[int] = None
+    train_minibatch_rows: Optional[int] = None
     use_dynamic_bsz: bool = False
     ppo_max_token_len_per_gpu: int = 16384
     ppo_infer_max_token_len_per_gpu: int = 16384
@@ -220,6 +227,10 @@ class ActorConfig(BaseConfig):
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""
+        if self.train_minibatch_rows is not None and self.train_minibatch_rows <= 0:
+            raise ValueError(
+                f"[actor] train_minibatch_rows ({self.train_minibatch_rows}) must be a positive integer"
+            )
         if not self.use_dynamic_bsz:
             if train_batch_size < self.ppo_mini_batch_size:
                 raise ValueError(

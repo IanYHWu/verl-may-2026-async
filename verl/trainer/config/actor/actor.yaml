@@ -23,6 +23,11 @@ ppo_micro_batch_size: null
 # Local per-GPU micro batch size
 ppo_micro_batch_size_per_gpu: null
 
+# Explicit row-level optimizer mini-batch size in sequences/rows
+# Overrides ppo_mini_batch_size * rollout.n as the per-update chunk size when set
+# For flat/multi-row recipes that must control optimizer steps per train step independently
+train_minibatch_rows: null
+
 # Whether to automatically adjust batch size at runtime
 # oc.select: the default val for ref.log_prob_use_dynamic_bsz
 use_dynamic_bsz: false

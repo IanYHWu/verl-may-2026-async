@@ -493,7 +493,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
             n = self.config.actor_rollout_ref.rollout.n
             ppo_mini = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-            divisor = max(self.actor_wg.world_size, ppo_mini * n)
+            # Default optimizer mini-batch is ppo_mini * n rows; an explicit
+            # train_minibatch_rows overrides it. Must match the split size that
+            # _update_actor (ray_trainer) passes to make_iterator.
+            train_minibatch_rows = self.config.actor_rollout_ref.actor.get("train_minibatch_rows", None)
+            mini_rows = int(train_minibatch_rows) if train_minibatch_rows else ppo_mini * n
+            divisor = max(self.actor_wg.world_size, mini_rows)
             if len(batch) % divisor != 0:
                 orig_size = len(batch)
                 # pad_dataproto_to_divisor concats slices, and DataProto.concat asserts
