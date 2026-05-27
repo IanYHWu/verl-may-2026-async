@@ -1229,6 +1229,12 @@ class RayPPOTrainer:
         )
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        # Flat/multi-row recipes may set an explicit row-level optimizer chunk size to
+        # decouple opt-steps-per-train-step from ppo_mini_batch_size (see ActorConfig).
+        # This is the single split site shared by colocate and the fully-async path.
+        train_minibatch_rows = self.config.actor_rollout_ref.actor.get("train_minibatch_rows", None)
+        if train_minibatch_rows:
+            ppo_mini_batch_size = int(train_minibatch_rows)
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
