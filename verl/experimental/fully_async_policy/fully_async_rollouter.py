@@ -796,7 +796,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         mgr = getattr(self, "async_rollout_manager", None)
         if mgr is not None and hasattr(mgr, "rollout_metrics"):
             try:
-                stats.update(mgr.rollout_metrics())
+                mgr_metrics = mgr.rollout_metrics()
+                stats.update(mgr_metrics)
+                # Tag which keys the manager contributed. Everything in rollout_status
+                # gets the fully_async/ bookkeeping prefix downstream; this lets the
+                # trainer ALSO surface the manager's metrics at their native top-level
+                # name (matching how the same recipe logs them in colocate) — without
+                # verl ever hardcoding a recipe's metric names.
+                if mgr_metrics:
+                    stats["manager_metric_keys"] = sorted(mgr_metrics.keys())
             except Exception as exc:  # noqa: BLE001 — metrics must never break rollout
                 print(f"[FullyAsyncRollouter] rollout_metrics() failed: {exc}", flush=True)
 

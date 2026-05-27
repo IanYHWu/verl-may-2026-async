@@ -871,15 +871,17 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                     "fully_async/count/current_param_version": self.current_param_version,
                 }
             )
+            # Keys a custom rollout manager contributed (tagged by the rollouter in
+            # get_statistics). assemble_batch_from_rollout_samples prefixes ALL
+            # rollout_status with "fully_async/"; for the manager's own metrics we ALSO
+            # log them at their native top-level name so a recipe's async metrics match
+            # the namespace it uses in colocate. Driven by the manager's declared keys —
+            # verl never hardcodes recipe-specific metric names.
+            mgr_keys = set(batch.meta_info.get("fully_async/manager_metric_keys") or [])
             for key, value in batch.meta_info.items():
+                if key == "fully_async/manager_metric_keys":
+                    continue  # bookkeeping list, not a metric
                 if key.startswith("fully_async") or key.startswith("timing_s"):
                     metrics[key] = value
-                    # Parity with the colocate trainer: custom rollout-status groups
-                    # (flat_rollout/*, response_length/*) are emitted by the manager
-                    # without the fully_async/ prefix in colocate. assemble_batch_from_
-                    # rollout_samples prepends "fully_async/" to every rollout_status
-                    # key, which buries them under the fully_async wandb section. Mirror
-                    # those two groups back to top-level so both run modes share panels.
-                    for grp in ("fully_async/flat_rollout/", "fully_async/response_length/"):
-                        if key.startswith(grp):
-                            metrics[key[len("fully_async/"):]] = value
+                    if key.startswith("fully_async/") and key[len("fully_async/"):] in mgr_keys:
+                        metrics[key[len("fully_async/"):]] = value
