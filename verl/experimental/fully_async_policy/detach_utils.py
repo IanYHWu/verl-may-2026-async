@@ -117,7 +117,13 @@ def assemble_batch_from_rollout_samples(
     print(f"[BatchUtils] Assembling batch from {len(rollout_samples)} RolloutSample objects")
 
     rollout_samples_batch = []
-    rollout_status = rollout_samples[0].rollout_status
+    # Use the LAST (freshest) sample's status, not the first. rollout_status is captured
+    # per-sample at generation time (_process_single_sample_streaming); a custom manager
+    # exposing rollout_metrics() (e.g. a rolling window) is sparse/cold for the
+    # first-completed sample, so rollout_samples[0] freezes a stale/empty snapshot
+    # (judge_reward=0, lengths pinned to the first group). The last-completed sample has
+    # the warmest window / most-current counts -> representative of the assembled batch.
+    rollout_status = rollout_samples[-1].rollout_status
     # Add a prefix to all rollout_status keys
     rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
 

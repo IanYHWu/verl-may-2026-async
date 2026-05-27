@@ -482,6 +482,38 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             if batch is None:
                 raise TrainingStopException("Training terminated: queue returned None")
             self._collect_metrics_from_samples(batch, metrics)
+            # The collected batch may not be a multiple of the actor's sequence-level
+            # mini-batch (ppo_mini_batch_size * n) when the rollout produces a variable
+            # number of rows per sample (e.g. per-step / multi-row agent recipes). Pad
+            # to a clean multiple and mask the pad rows out of the gradient so the
+            # mini-batch split is valid. No-op when already divisible.
+            import torch as _torch
+
+            from verl.protocol import pad_dataproto_to_divisor
+
+            n = self.config.actor_rollout_ref.rollout.n
+            ppo_mini = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            divisor = max(self.actor_wg.world_size, ppo_mini * n)
+            if len(batch) % divisor != 0:
+                orig_size = len(batch)
+                # pad_dataproto_to_divisor concats slices, and DataProto.concat asserts
+                # meta_info[k] == v per key — which raises on array-valued meta_info
+                # (e.g. trajectory_param_versions). meta_info is batch-level and already
+                # consumed by _collect_metrics_from_samples above, so clear it across the
+                # pad, then restore it and recompute the per-row global_token_num.
+                saved_meta = batch.meta_info
+                batch.meta_info = {}
+                batch, pad_size = pad_dataproto_to_divisor(batch, divisor)
+                batch.meta_info = saved_meta
+                if "response_mask" in batch.batch:
+                    batch.batch["response_mask"][orig_size:] = 0
+                for _k in ("rm_scores", "token_level_rewards", "token_level_scores", "advantages"):
+                    if _k in batch.batch:
+                        batch.batch[_k][orig_size:] = 0
+                if "attention_mask" in batch.batch:
+                    batch.meta_info["global_token_num"] = _torch.sum(
+                        batch.batch["attention_mask"], dim=-1).tolist()
+                metrics["fully_async/batch_pad_rows"] = float(pad_size)
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         return batch
 
@@ -620,24 +652,31 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # Wait for rollouter validation result and log
         val_metrics: ValidateMetrics = await asyncio.wrap_future(val_future.future())
+        # Log val on the SAME wandb step axis as the train metrics. The train series
+        # advances `step` by self.global_steps (≈ trigger * current_param_version), so
+        # logging val at step=current_param_version is a BACKWARD step (e.g. 15 vs the
+        # current ~30) -> wandb silently drops non-monotonic logs and val never appears.
+        # global_steps+1 is the step _fit_postprocess_step/_fit_update_weights use for
+        # this same fit_step, so val rides on the matching train point.
+        val_step = self.global_steps + 1
         if train_val_metrics:
             # Merge trainer and rollouter validation results
             with marked_timer("timing_s/merge_val", self.timing_raw):
                 new_metrics = self._merge_validation_results(train_val_metrics, val_metrics.metrics)
             if new_metrics:
-                self.logger.log(data=new_metrics, step=self.current_param_version)
+                self.logger.log(data=new_metrics, step=val_step)
                 pprint(
                     f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
                     f"Validation metrics: {new_metrics}, timing: {self.timing_raw['timing_s/merge_val']}"
                 )
         else:
             if val_metrics.metrics:
-                self.logger.log(data=val_metrics.metrics, step=self.current_param_version)
+                self.logger.log(data=val_metrics.metrics, step=val_step)
                 pprint(
                     f"[FullyAsyncTrainer] parameter version: {self.current_param_version} "
                     f"Validation metrics: {val_metrics.metrics}"
                 )
-        self.logger.log(data=val_metrics.timing_raw, step=self.current_param_version)
+        self.logger.log(data=val_metrics.timing_raw, step=val_step)
 
         # Merge and log validation generations from rollouter (and trainer if applicable)
         generations_to_log = self.config.trainer.log_val_generations
@@ -832,6 +871,17 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                     "fully_async/count/current_param_version": self.current_param_version,
                 }
             )
+            # Keys a custom rollout manager contributed (tagged by the rollouter in
+            # get_statistics). assemble_batch_from_rollout_samples prefixes ALL
+            # rollout_status with "fully_async/"; for the manager's own metrics we ALSO
+            # log them at their native top-level name so a recipe's async metrics match
+            # the namespace it uses in colocate. Driven by the manager's declared keys —
+            # verl never hardcodes recipe-specific metric names.
+            mgr_keys = set(batch.meta_info.get("fully_async/manager_metric_keys") or [])
             for key, value in batch.meta_info.items():
+                if key == "fully_async/manager_metric_keys":
+                    continue  # bookkeeping list, not a metric
                 if key.startswith("fully_async") or key.startswith("timing_s"):
                     metrics[key] = value
+                    if key.startswith("fully_async/") and key[len("fully_async/"):] in mgr_keys:
+                        metrics[key[len("fully_async/"):]] = value

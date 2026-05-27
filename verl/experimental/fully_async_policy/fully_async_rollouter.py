@@ -37,6 +37,7 @@ from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
@@ -464,7 +465,17 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         self.async_rollout_mode = True
         self.llm_server_manager = await LLMServerManager.create(config=self.config)
-        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
+        # Support custom AgentLoopManager via config, for parity with the colocate
+        # (ray_trainer), sync (main_ppo_sync), and one-step-off trainers, which all
+        # honor actor_rollout_ref.rollout.agent.agent_loop_manager_class. Defaults to
+        # FullyAsyncAgentLoopManager when unset, so existing async runs are unchanged.
+        manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
+        manager_cls = (
+            load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+            if manager_class_fqn
+            else FullyAsyncAgentLoopManager
+        )
+        self.async_rollout_manager = await manager_cls.create(
             config=self.config,
             llm_client=self.llm_server_manager.get_client(fully_async=True),
             reward_loop_worker_handles=reward_loop_worker_handles,
@@ -776,5 +787,25 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "static/max_queue_size": self.max_queue_size,
             "static/max_concurrent_samples": self.max_concurrent_samples,
         }
+
+        # Surface metrics from a custom rollout manager (e.g. per-step recipe stats:
+        # termination distribution, reward, response lengths) so they reach wandb via
+        # rollout_status. Generic: any manager exposing rollout_metrics() -> dict
+        # participates; the stock FullyAsyncAgentLoopManager doesn't, so this is a no-op
+        # for default runs.
+        mgr = getattr(self, "async_rollout_manager", None)
+        if mgr is not None and hasattr(mgr, "rollout_metrics"):
+            try:
+                mgr_metrics = mgr.rollout_metrics()
+                stats.update(mgr_metrics)
+                # Tag which keys the manager contributed. Everything in rollout_status
+                # gets the fully_async/ bookkeeping prefix downstream; this lets the
+                # trainer ALSO surface the manager's metrics at their native top-level
+                # name (matching how the same recipe logs them in colocate) — without
+                # verl ever hardcoding a recipe's metric names.
+                if mgr_metrics:
+                    stats["manager_metric_keys"] = sorted(mgr_metrics.keys())
+            except Exception as exc:  # noqa: BLE001 — metrics must never break rollout
+                print(f"[FullyAsyncRollouter] rollout_metrics() failed: {exc}", flush=True)
 
         return stats
