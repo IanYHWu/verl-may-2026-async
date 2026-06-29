@@ -83,6 +83,10 @@ class LLMJudgeRewardManager(RewardManagerBase):
             max_retries=int(judge_cfg.get("max_retries", 3)),
             retry_backoff_s=float(judge_cfg.get("retry_backoff_s", 2.0)),
             max_concurrency=int(judge_cfg.get("max_concurrency", 32)),
+            # Forward max_tokens_param so OpenAI reasoning models (gpt-5-*,
+            # o-series) that require "max_completion_tokens" can be used
+            # as judges. Default ("max_tokens") matches vLLM-served judges.
+            max_tokens_param=str(judge_cfg.get("max_tokens_param", "max_tokens")),
         )
 
         # extra_fields: declarative map of "<<template_var>>" -> "dotted.path"
