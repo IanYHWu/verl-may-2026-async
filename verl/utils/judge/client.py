@@ -166,36 +166,66 @@ class JudgeClient:
                         raise PermissionError(f"HTTP {resp.status}: {(await resp.text())[:500]}")
 
                     if stream:
-                        # SSE: accumulate the delta content as chunks arrive. Each
-                        # chunk forwarded by the tunnel resets the edge write-deadline,
-                        # so long generations don't get cut at ~252s. Mirrors the
-                        # non-streaming path: take `content` (+ any `reasoning_content`
-                        # the server emits, in order) so extract_summary sees the same
-                        # text it would non-streamed.
-                        content = ""
-                        finish_reason = None
-                        async for raw in resp.content:
-                            line = raw.decode("utf-8", "ignore").strip()
+                        # SSE: accumulate delta content as it arrives, so each chunk the
+                        # tunnel forwards resets the edge write-deadline and long
+                        # generations don't get cut at ~252s. resp.content may yield
+                        # arbitrary byte chunks (and aiohttp's line iterator caps a line at
+                        # 64 KiB), so we buffer raw bytes and split on newlines ourselves —
+                        # robust to multi-line chunks, lines split across reads, oversized
+                        # lines, and UTF-8 chars split across reads. Mirrors the
+                        # non-streaming path (choices[0], reasoning_content + content).
+                        parts: list[str] = []
+                        flags: dict[str, Any] = {"done": False, "finish": None}
+
+                        def _feed(line_bytes: bytes) -> None:
+                            line = line_bytes.decode("utf-8", "replace").strip()
                             if not line.startswith("data:"):
-                                continue
-                            payload = line[5:].strip()
+                                return  # blank line, SSE comment/keep-alive, or event:/id:
+                            payload = line[5:].lstrip()
                             if payload == "[DONE]":
-                                break
+                                flags["done"] = True
+                                return
                             try:
                                 chunk = _json.loads(payload)
-                            except Exception:  # noqa: BLE001 -- skip keep-alives / partial lines
-                                continue
-                            ch = (chunk.get("choices") or [{}])[0]
-                            delta = ch.get("delta") or {}
-                            content += (delta.get("reasoning_content") or "") + (delta.get("content") or "")
-                            if ch.get("finish_reason"):
-                                finish_reason = ch["finish_reason"]
+                            except Exception:  # noqa: BLE001 -- partial/garbled line, skip
+                                return
+                            if isinstance(chunk, dict) and chunk.get("error"):
+                                # mid-stream error frame -> raise so the retry loop reruns
+                                raise RuntimeError(f"SSE error frame: {str(chunk['error'])[:300]}")
+                            choices = chunk.get("choices") or []
+                            if choices:
+                                ch = choices[0] or {}
+                                delta = ch.get("delta") or {}
+                                parts.append((delta.get("reasoning_content") or "") + (delta.get("content") or ""))
+                                if ch.get("finish_reason"):
+                                    flags["finish"] = ch["finish_reason"]
+
+                        buf = b""
+                        async for raw in resp.content.iter_any():
+                            buf += raw
+                            while b"\n" in buf:
+                                line_bytes, buf = buf.split(b"\n", 1)
+                                _feed(line_bytes)
+                                if flags["done"]:
+                                    break
+                            if flags["done"]:
+                                break
+                        if not flags["done"] and buf.strip():
+                            _feed(buf)  # stream may end without a trailing newline
+
+                        # A well-formed SSE stream ends with [DONE] or at least a terminal
+                        # finish_reason. Neither => the connection was cut mid-stream (e.g.
+                        # a tunnel drop) and the text is truncated -> treat as transient so
+                        # the retry loop reruns instead of grading partial content.
+                        if not flags["done"] and flags["finish"] is None:
+                            raise RuntimeError("SSE stream truncated (no [DONE]/finish_reason)")
+
                         return {
-                            "content": content,
+                            "content": "".join(parts),
                             "latency_s": time.perf_counter() - t0,
                             "attempts": attempt + 1,
                             "raw": None,
-                            "finish_reason": finish_reason,
+                            "finish_reason": flags["finish"],
                         }
 
                     text = await resp.text()
