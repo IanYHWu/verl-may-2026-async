@@ -639,6 +639,12 @@ def process_validation_metrics(
                 # skip empty or string values
                 if not var_vals or isinstance(var_vals[0], str):
                     continue
+                # Drop None entries (e.g. reward extra_info fields like
+                # ``judge_error`` are None on success, str on failure).
+                # If ALL are None, skip the metric entirely.
+                var_vals = [v for v in var_vals if v is not None]
+                if not var_vals or isinstance(var_vals[0], str):
+                    continue
 
                 # compute mean and std
                 n_resps = len(var_vals)
