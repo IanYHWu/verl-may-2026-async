@@ -82,7 +82,16 @@ class JudgeClient:
         # Lazy init: aiohttp requires a running event loop at construction time.
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=self.timeout_s)
-            self._session = aiohttp.ClientSession(timeout=timeout, headers=self._headers)
+            # limit=0 (unlimited) so aiohttp's default TCPConnector cap of 100 does NOT
+            # throttle concurrency below the semaphore. Without this, an ExternalEClient
+            # with max_concurrency>100 (e.g. 1024) was silently capped at 100 concurrent
+            # E calls -> each per-layer E burst serialized into ~8 waves. The semaphore
+            # (max_concurrency) is the real bound. Matches inference/e_remote.py.
+            self._session = aiohttp.ClientSession(
+                timeout=timeout,
+                headers=self._headers,
+                connector=aiohttp.TCPConnector(limit=0),
+            )
         return self._session
 
     async def close(self) -> None:
@@ -98,7 +107,9 @@ class JudgeClient:
         top_p: float = 1.0,
         reasoning_effort: Optional[str] = None,
         thinking_mode: Optional[bool] = None,
+        skip_special_tokens: Optional[bool] = None,
         extra_body: Optional[dict[str, Any]] = None,
+        stream: bool = False,
     ) -> dict[str, Any]:
         """Issue one chat-completions call. Returns content + telemetry."""
         body: dict[str, Any] = {
@@ -117,6 +128,19 @@ class JudgeClient:
         if reasoning_effort is not None:
             body["reasoning_effort"] = reasoning_effort
 
+        # vLLM-only: keep added special tokens (e.g. the meta-reasoning
+        # <summary>/<direction>) in the returned text. MUST be top-level — vLLM
+        # ignores it nested under extra_body. Omit (None) for OpenAI judges.
+        if skip_special_tokens is not None:
+            body["skip_special_tokens"] = skip_special_tokens
+
+        # Stream the response as SSE so the tunnel forwards each token chunk
+        # immediately. This resets the Cloudflare edge write-deadline on every
+        # chunk, so long external-E generations don't hit the ~252s cutoff that
+        # buffered (non-streaming) responses do on the Free plan.
+        if stream:
+            body["stream"] = True
+
         # qwen-style thinking-mode toggle. Pass through extra_body so the
         # server can route it into apply_chat_template kwargs.
         merged_extra: dict[str, Any] = {}
@@ -133,16 +157,49 @@ class JudgeClient:
                 session = await self._get_session()
                 t0 = time.perf_counter()
                 async with session.post(self.endpoint_url, json=body) as resp:
-                    text = await resp.text()
-                    latency = time.perf_counter() - t0
-                    if resp.status >= 500 or resp.status == 429:
-                        raise RuntimeError(f"HTTP {resp.status}: {text[:500]}")
-                    if resp.status >= 400:
-                        # 4xx (other than 429) is a non-retryable client error.
-                        raise PermissionError(f"HTTP {resp.status}: {text[:500]}")
-
                     import json as _json
 
+                    if resp.status >= 500 or resp.status == 429:
+                        raise RuntimeError(f"HTTP {resp.status}: {(await resp.text())[:500]}")
+                    if resp.status >= 400:
+                        # 4xx (other than 429) is a non-retryable client error.
+                        raise PermissionError(f"HTTP {resp.status}: {(await resp.text())[:500]}")
+
+                    if stream:
+                        # SSE: accumulate the delta content as chunks arrive. Each
+                        # chunk forwarded by the tunnel resets the edge write-deadline,
+                        # so long generations don't get cut at ~252s. Mirrors the
+                        # non-streaming path: take `content` (+ any `reasoning_content`
+                        # the server emits, in order) so extract_summary sees the same
+                        # text it would non-streamed.
+                        content = ""
+                        finish_reason = None
+                        async for raw in resp.content:
+                            line = raw.decode("utf-8", "ignore").strip()
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[5:].strip()
+                            if payload == "[DONE]":
+                                break
+                            try:
+                                chunk = _json.loads(payload)
+                            except Exception:  # noqa: BLE001 -- skip keep-alives / partial lines
+                                continue
+                            ch = (chunk.get("choices") or [{}])[0]
+                            delta = ch.get("delta") or {}
+                            content += (delta.get("reasoning_content") or "") + (delta.get("content") or "")
+                            if ch.get("finish_reason"):
+                                finish_reason = ch["finish_reason"]
+                        return {
+                            "content": content,
+                            "latency_s": time.perf_counter() - t0,
+                            "attempts": attempt + 1,
+                            "raw": None,
+                            "finish_reason": finish_reason,
+                        }
+
+                    text = await resp.text()
+                    latency = time.perf_counter() - t0
                     data = _json.loads(text)
                     choice = data["choices"][0]
                     message = choice.get("message", {})
