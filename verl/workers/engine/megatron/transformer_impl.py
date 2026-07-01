@@ -44,6 +44,7 @@ from verl.utils.megatron.router_replay_utils import (
 )
 from verl.utils.megatron.tensor_parallel import (
     vocab_parallel_entropy,
+    vocab_parallel_entropy_chunked,
     vocab_parallel_log_probs_from_logits,
     vocab_parallel_sum_pi_squared,
 )
@@ -924,7 +925,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
                         # without autograd save_for_backward there is no in-place mutation
                         # later. logits stays usable for log_prob below.
                         with torch.no_grad():
-                            entropy = vocab_parallel_entropy(logits.detach())
+                            # Chunked over tokens: monitoring-only entropy must not materialize the
+                            # full [tokens × vocab_shard] copy (OOMs on a long FA row × 248k vocab).
+                            entropy = vocab_parallel_entropy_chunked(logits.detach())
                         logits_bak = logits
                     else:
                         # Loss-contributing entropy: clone logits so log_prob.backward and
