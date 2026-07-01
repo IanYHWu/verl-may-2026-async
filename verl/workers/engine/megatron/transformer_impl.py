@@ -988,10 +988,17 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
                 from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
-                hidden = output_orig.hidden_states  # [b, s, H]
+                hidden = output_orig.hidden_states  # Megatron is sequence-first: [s, b, H]
                 output_weight = output_orig.output_weight  # [vocab_shard, H]
-                assert hidden.shape[:2] == label.shape[:2], (hidden.shape, label.shape)
                 b, s = label.shape[:2]
+                # Megatron hidden states are [seq, batch, H]. Transpose to [batch, seq, H] so the
+                # row-major flatten below aligns token-for-token with labels [batch, seq]. The offline
+                # validation used synthetic [b, s, H] tensors, so it never exercised this; the real
+                # forward returns [s, b, H], which failed the old shape assert (and would misalign for
+                # batch>1). Transpose is autograd-transparent (grad flows back to [s, b, H] hidden).
+                if hidden.dim() == 3 and hidden.shape[0] == s and hidden.shape[1] == b:
+                    hidden = hidden.transpose(0, 1).contiguous()  # [s, b, H] -> [b, s, H]
+                assert hidden.shape[:2] == label.shape[:2], (hidden.shape, label.shape)
 
                 hidden_flat = hidden.reshape(-1, hidden.shape[-1]).contiguous()
                 labels_flat = label.reshape(-1).contiguous()
@@ -1028,8 +1035,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 if mem_efficient_ce_patched:
                     # Model returns hidden; reconstruct sharded logits for the legacy path.
                     output_orig = logits
-                    hidden = output_orig.hidden_states
+                    hidden = output_orig.hidden_states  # Megatron sequence-first: [s, b, H]
                     output_weight = output_orig.output_weight
+                    b_, s_ = label.shape[:2]
+                    # Match the fused path: transpose [s, b, H] -> [b, s, H] so reconstructed
+                    # logits are [b, s, vocab] and pass the shape assert below.
+                    if hidden.dim() == 3 and hidden.shape[0] == s_ and hidden.shape[1] == b_:
+                        hidden = hidden.transpose(0, 1).contiguous()  # [s, b, H] -> [b, s, H]
                     logits = torch.matmul(hidden, output_weight.t())
                 assert logits.shape[:2] == label.shape[:2]
                 # avoid non-positive temperature such as padding
