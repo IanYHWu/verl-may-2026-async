@@ -497,8 +497,16 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # train_minibatch_rows overrides it. Must match the split size that
             # _update_actor (ray_trainer) passes to make_iterator.
             train_minibatch_rows = self.config.actor_rollout_ref.actor.get("train_minibatch_rows", None)
-            mini_rows = int(train_minibatch_rows) if train_minibatch_rows else ppo_mini * n
-            divisor = max(self.actor_wg.world_size, mini_rows)
+            if train_minibatch_rows == 0:
+                # Full-batch mode: exactly ONE optimizer step over the whole batch, so pad ONLY
+                # to DP-divisibility (world_size ⊇ dp_size) instead of up to a fixed row count.
+                # _update_actor sets mini_batch_size = len(batch), so make_iterator's
+                # `batch % mini_batch_size == 0` holds trivially. Minimizes masked-pad waste while
+                # keeping opt-steps-per-train-step = 1 regardless of the variable per-step row count.
+                divisor = self.actor_wg.world_size
+            else:
+                mini_rows = int(train_minibatch_rows) if train_minibatch_rows else ppo_mini * n
+                divisor = max(self.actor_wg.world_size, mini_rows)
             if len(batch) % divisor != 0:
                 orig_size = len(batch)
                 # pad_dataproto_to_divisor concats slices, and DataProto.concat asserts
