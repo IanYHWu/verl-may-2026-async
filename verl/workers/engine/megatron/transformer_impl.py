@@ -44,6 +44,7 @@ from verl.utils.megatron.router_replay_utils import (
 )
 from verl.utils.megatron.tensor_parallel import (
     vocab_parallel_entropy,
+    vocab_parallel_entropy_chunked,
     vocab_parallel_log_probs_from_logits,
     vocab_parallel_sum_pi_squared,
 )
@@ -96,6 +97,10 @@ class MegatronEngine(BaseEngine):
         self._is_offload_optimizer = self.engine_config.optimizer_offload
 
         self.mode = None
+
+        # Set by _maybe_enable_mem_efficient_ce() during initialize(); safe default here so the
+        # forward path can always read it even before initialize() runs.
+        self._mem_efficient_ce = False
 
         self.layer_name_mapping = {
             "qkv_layer_name": "self_attention.linear_qkv.",
@@ -331,6 +336,44 @@ class MegatronEngine(BaseEngine):
         for model in self.module:
             patch_fused_forward(model)
 
+    def _maybe_enable_mem_efficient_ce(self):
+        """Opt-in (env ``VERL_MEGATRON_MEM_EFFICIENT_CE=1``): route the *non-fused* bshd path
+        through the fused ``linear_cross_entropy`` kernel to avoid the full ``[tokens x vocab_shard]``
+        logits + gradient materialization that OOMs on long (~100k-token) rows.
+
+        Unlike ``use_fused_kernels`` (which requires ``use_remove_padding=True`` / THD packing that
+        the GatedDeltaNet layers reject), this patches the model to return HIDDEN states and runs the
+        LM-head + CE fusion inside the engine's ``logits_processor``. It is numerically equivalent to
+        the legacy ``vocab_parallel_log_probs_from_logits`` / ``vocab_parallel_entropy`` path.
+        """
+        self._mem_efficient_ce = os.getenv("VERL_MEGATRON_MEM_EFFICIENT_CE", "0") == "1"
+        if not self._mem_efficient_ce:
+            return
+
+        if self.is_value_model or self.model_config.mtp.enable:
+            logger.warning_once(
+                "Memory-efficient CE is not supported for value models or when MTP is enabled; disabling."
+            )
+            self._mem_efficient_ce = False
+            return
+
+        if self.engine_config.use_fused_kernels:
+            # use_fused_kernels already patches the model to the (thd) fused forward; don't double-patch.
+            logger.warning_once(
+                "VERL_MEGATRON_MEM_EFFICIENT_CE ignored because use_fused_kernels=True is already active."
+            )
+            self._mem_efficient_ce = False
+            return
+
+        from verl.models.mcore.model_forward_fused import patch_hidden_forward
+
+        for model in self.module:
+            patch_hidden_forward(model)
+        logger.warning_once(
+            "Memory-efficient CE ENABLED (VERL_MEGATRON_MEM_EFFICIENT_CE=1): non-fused Megatron path "
+            "will fuse LM head + cross-entropy via linear_cross_entropy (returns hidden, no full logits)."
+        )
+
     def _build_optimizer(self):
         from verl.utils.megatron.optimizer import get_megatron_optimizer, init_megatron_optim_config
 
@@ -377,6 +420,7 @@ class MegatronEngine(BaseEngine):
             self.module = apply_qat_to_modules(self.module, self._qat_config)
 
         self._maybe_enable_fused_kernels()
+        self._maybe_enable_mem_efficient_ce()
 
         if self.model_config.mtp.enable:
             patch_engine_mtp(self.module, self.model_config)
@@ -895,6 +939,33 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 pad_token_id=self.model_config.tokenizer.pad_token_id,
             )
         else:
+            # Memory-efficient CE (opt-in): the model is patched to return HIDDEN states and the
+            # LM head + cross-entropy are fused via linear_cross_entropy, so the full
+            # [tokens x vocab_shard] logits (and its grad) are never materialized. The kernel only
+            # supports a single scalar temperature, so capture it here before per-token expansion.
+            mem_efficient_ce = getattr(self, "_mem_efficient_ce", False)
+            if mem_efficient_ce:
+                if isinstance(temperature, torch.Tensor):
+                    if temperature.numel() == 1:
+                        mem_ce_temperature = float(temperature.item())
+                    elif bool((temperature == temperature.reshape(-1)[0]).all().item()):
+                        mem_ce_temperature = float(temperature.reshape(-1)[0].item())
+                    else:
+                        logger.warning_once(
+                            "Memory-efficient CE does not support per-sample temperature; "
+                            "falling back to the full-logits path for this batch."
+                        )
+                        mem_efficient_ce = False
+                else:
+                    mem_ce_temperature = float(temperature)
+                if mem_efficient_ce and (calculate_sum_pi_squared or distillation_use_topk):
+                    # These need the full logits tensor; the fused path never materializes it.
+                    logger.warning_once(
+                        "Memory-efficient CE cannot serve calculate_sum_pi_squared / distillation_use_topk; "
+                        "falling back to the full-logits path for this batch."
+                    )
+                    mem_efficient_ce = False
+
             if not isinstance(temperature, torch.Tensor):
                 temperature = torch.tensor([temperature] * input_ids.shape[0], device=input_ids.device)
 
@@ -906,7 +977,72 @@ class MegatronEngineWithLMHead(MegatronEngine):
             forward_fn = get_mcore_engine_forward_fn(self.model_config.hf_config)
             data_format = "thd" if self.engine_config.use_remove_padding else "bshd"
 
+            def mem_efficient_logits_processor(output_orig, label, temperature):
+                """Fused LM-head + CE on hidden states (see _hidden_only_GPTModel_forward).
+
+                ``output_orig`` is a CausalLMOutputForPPO carrying ``hidden_states`` [b, s, H] and
+                ``output_weight`` [vocab_shard, H]. Returns log_probs / entropy of shape [b, s],
+                numerically equivalent to the vocab_parallel_log_probs_from_logits / entropy path.
+                """
+                from megatron.core import parallel_state as _mpu
+
+                from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
+
+                hidden = output_orig.hidden_states  # Megatron is sequence-first: [s, b, H]
+                output_weight = output_orig.output_weight  # [vocab_shard, H]
+                b, s = label.shape[:2]
+                # Megatron hidden states are [seq, batch, H]. Transpose to [batch, seq, H] so the
+                # row-major flatten below aligns token-for-token with labels [batch, seq]. The offline
+                # validation used synthetic [b, s, H] tensors, so it never exercised this; the real
+                # forward returns [s, b, H], which failed the old shape assert (and would misalign for
+                # batch>1). Transpose is autograd-transparent (grad flows back to [s, b, H] hidden).
+                if hidden.dim() == 3 and hidden.shape[0] == s and hidden.shape[1] == b:
+                    hidden = hidden.transpose(0, 1).contiguous()  # [s, b, H] -> [b, s, H]
+                assert hidden.shape[:2] == label.shape[:2], (hidden.shape, label.shape)
+
+                hidden_flat = hidden.reshape(-1, hidden.shape[-1]).contiguous()
+                labels_flat = label.reshape(-1).contiguous()
+
+                tp_size = _mpu.get_tensor_model_parallel_world_size()
+                # TP=1 uses the single-rank fast path (no all-reduce); TP>1 passes the TP group so the
+                # kernel does the vocab-parallel max / sum / logprob all-reduces.
+                pg = None if tp_size == 1 else _mpu.get_tensor_model_parallel_group()
+
+                log_probs, entropy = linear_cross_entropy(
+                    hidden_flat,
+                    output_weight,
+                    labels_flat,
+                    mem_ce_temperature,
+                    "none",
+                    pg,
+                )
+                ret = {"log_probs": log_probs.reshape(b, s)}
+                if calculate_entropy:
+                    ret["entropy"] = entropy.reshape(b, s)
+                return ret
+
+            # When the model is patched for memory-efficient CE it ALWAYS returns hidden states
+            # (a CausalLMOutputForPPO), never logits. So the full-logits branch below is only
+            # reachable when the model was NOT patched. If mem-efficient CE is enabled but this
+            # particular batch can't use the fused kernel (per-sample temperature / sum_pi_squared /
+            # distillation topk), we must reconstruct logits from hidden here so the legacy branch
+            # still works. This is the rare fallback; the common case stays fused.
+            mem_efficient_ce_patched = getattr(self, "_mem_efficient_ce", False)
+
             def logits_processor(logits, label, temperature):
+                if mem_efficient_ce:
+                    return mem_efficient_logits_processor(logits, label, temperature)
+                if mem_efficient_ce_patched:
+                    # Model returns hidden; reconstruct sharded logits for the legacy path.
+                    output_orig = logits
+                    hidden = output_orig.hidden_states  # Megatron sequence-first: [s, b, H]
+                    output_weight = output_orig.output_weight
+                    b_, s_ = label.shape[:2]
+                    # Match the fused path: transpose [s, b, H] -> [b, s, H] so reconstructed
+                    # logits are [b, s, vocab] and pass the shape assert below.
+                    if hidden.dim() == 3 and hidden.shape[0] == s_ and hidden.shape[1] == b_:
+                        hidden = hidden.transpose(0, 1).contiguous()  # [s, b, H] -> [b, s, H]
+                    logits = torch.matmul(hidden, output_weight.t())
                 assert logits.shape[:2] == label.shape[:2]
                 # avoid non-positive temperature such as padding
                 temperature[temperature <= 0] = 1e-8
@@ -924,7 +1060,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
                         # without autograd save_for_backward there is no in-place mutation
                         # later. logits stays usable for log_prob below.
                         with torch.no_grad():
-                            entropy = vocab_parallel_entropy(logits.detach())
+                            # Chunked over tokens: monitoring-only entropy must not materialize the
+                            # full [tokens × vocab_shard] copy (OOMs on a long FA row × 248k vocab).
+                            entropy = vocab_parallel_entropy_chunked(logits.detach())
                         logits_bak = logits
                     else:
                         # Loss-contributing entropy: clone logits so log_prob.backward and

@@ -151,6 +151,26 @@ def vocab_parallel_entropy(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
     return _VocabParallelEntropy.apply(vocab_parallel_logits)
 
 
+def vocab_parallel_entropy_chunked(vocab_parallel_logits: torch.Tensor, chunk_size: int = 2048) -> torch.Tensor:
+    """Memory-efficient (chunked) entropy for MONITORING only (call under torch.no_grad()).
+
+    Same per-token entropy as ``vocab_parallel_entropy``, but bounds the intermediate
+    ``logits - logits_max`` / softmax copy to ``chunk_size`` tokens at a time (~chunk_size ×
+    vocab_shard) instead of materializing the full [tokens × vocab_shard] tensor -- which OOMs on a
+    long FA row × the 248k vocab (crashed the run 2026-07-01: a single ~50k-token row's copy = 49.74
+    GiB). Per-token entropy is independent, so chunking is exact. The per-chunk TP all-reduces are
+    collective-safe: every TP rank shares the same token count (vocab, not tokens, is sharded), so
+    all ranks in a TP group issue the same number of all-reduces.
+    """
+    lead = vocab_parallel_logits.shape[:-1]
+    flat = vocab_parallel_logits.reshape(-1, vocab_parallel_logits.shape[-1])
+    n = flat.shape[0]
+    if n <= chunk_size:
+        return vocab_parallel_entropy(flat).reshape(lead)
+    parts = [vocab_parallel_entropy(flat[i : i + chunk_size]) for i in range(0, n, chunk_size)]
+    return torch.cat(parts, dim=0).reshape(lead)
+
+
 def vocab_parallel_sum_pi_squared(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
     """Compute Σπ² (sum of squared probabilities) when logits are sharded across tp ranks.
 

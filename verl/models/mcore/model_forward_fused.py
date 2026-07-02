@@ -65,6 +65,107 @@ def unpatch_fused_forward(model: torch.nn.Module):
         model.forward = model.forward_backup
 
 
+def _get_output_weight(model):
+    """Return the LM-head (output) weight, handling tied embeddings.
+
+    Mirrors the weight lookup in ``_fused_GPTModel_forward``.
+    """
+    if hasattr(model, "output_layer") and model.output_layer is not None and model.output_layer.weight is not None:
+        return model.output_layer.weight
+    # When embeddings are tied, use the embedding weight.
+    return model.embedding.word_embeddings.weight
+
+
+def _hidden_only_GPTModel_forward(
+    model,
+    input_ids: Tensor,
+    position_ids: Tensor,
+    attention_mask: Tensor,
+    decoder_input: Tensor = None,
+    labels: Tensor = None,
+    inference_context: BaseInferenceContext = None,
+    packed_seq_params: PackedSeqParams = None,
+    extra_block_kwargs: dict = None,
+    runtime_gather_output: Optional[bool] = None,
+    *,
+    inference_params: Optional[BaseInferenceContext] = None,
+    loss_mask: Optional[Tensor] = None,
+    temperature: float = 1.0,
+    **kwargs,
+) -> CausalLMOutputForPPO:
+    """Patched GPTModel.forward that RETURNS HIDDEN STATES instead of applying the LM head.
+
+    This is the memory-efficient-CE variant used by the *non-fused* (bshd / no-remove-padding)
+    Megatron engine path. Unlike ``_fused_GPTModel_forward``, it does NOT run the fused
+    cross-entropy kernel here: it only returns the pre-LM-head hidden states (SP-gathered) plus a
+    handle to the output weight. The engine's ``logits_processor`` then runs
+    ``linear_cross_entropy(hidden, output_weight, label, temperature, "none", tp_group)`` so that
+    the label-shift / temperature / reduction semantics stay in exactly one place and match the
+    legacy ``logits -> vocab_parallel_log_probs_from_logits / vocab_parallel_entropy`` path.
+
+    Returning hidden ``[b, s, H]`` (instead of ``[b, s, vocab_shard]`` logits) is what avoids the
+    ~50 GiB full-logits + full-grad materialization that OOMs on ~100k-token FA rows.
+    """
+    inference_context = deprecate_inference_params(inference_context, inference_params)
+
+    preproc_output = model._preprocess(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        decoder_input=decoder_input,
+        inference_context=inference_context,
+        packed_seq_params=packed_seq_params,
+    )
+
+    (decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset) = preproc_output[:5]
+
+    hidden_states = model.decoder(
+        hidden_states=decoder_input,
+        attention_mask=attention_mask,
+        inference_context=inference_context,
+        rotary_pos_emb=rotary_pos_emb,
+        rotary_pos_cos=rotary_pos_cos,
+        rotary_pos_sin=rotary_pos_sin,
+        packed_seq_params=packed_seq_params,
+        sequence_len_offset=sequence_len_offset,
+        **(extra_block_kwargs or {}),
+        **kwargs,
+    )
+
+    if not model.post_process:
+        return hidden_states
+
+    if model.config.sequence_parallel:
+        hidden_states = gather_from_sequence_parallel_region(hidden_states)
+
+    output = CausalLMOutputForPPO(
+        loss=None,
+        logits=None,
+        past_key_values=None,
+        hidden_states=hidden_states,
+        attentions=None,
+    )
+    # Stash the output weight so the engine's logits_processor can fuse the LM head + CE.
+    output.output_weight = _get_output_weight(model)
+    return output
+
+
+def patch_hidden_forward(model: torch.nn.Module):
+    """Patch GPTModel.forward to return hidden states (see ``_hidden_only_GPTModel_forward``)."""
+    assert version.parse(mcore.__version__) >= version.parse("0.13.0"), (
+        "Hidden-forward patching requires mecore >= 0.13.0"
+    )
+    model = _get_patching_model(model)
+    if model is not None:
+        model.forward_backup = model.forward
+        model.forward = _hidden_only_GPTModel_forward.__get__(model, model.__class__)
+
+
+def unpatch_hidden_forward(model: torch.nn.Module):
+    model = _get_patching_model(model)
+    if model is not None:
+        model.forward = model.forward_backup
+
+
 def fused_forward_model_gen(vision_model: bool = False):
     def fused_forward_model(
         model,

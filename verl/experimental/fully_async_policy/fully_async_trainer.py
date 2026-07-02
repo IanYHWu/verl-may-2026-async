@@ -279,11 +279,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
 
         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
-        # Assemble batch - now working directly with RolloutSample objects
-        if self.config.trainer.balance_batch:
-            batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
-        else:
-            batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
+        # Assemble batch. Balancing is DEFERRED to _fit_generate (AFTER the pad that makes the
+        # row count DP-divisible): _balance_batch uses equal_size=True (asserts len % dp_size == 0),
+        # but a variable/odd per-step row count (e.g. the v3 flat MR/E/FA rollout) crashes
+        # karmarkar_karp if balanced here, PRE-pad. Assemble without balancing.
+        batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
 
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
         return 0, batch
@@ -519,6 +519,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                     batch.meta_info["global_token_num"] = _torch.sum(
                         batch.batch["attention_mask"], dim=-1).tolist()
                 metrics["fully_async/batch_pad_rows"] = float(pad_size)
+            # Balance sequence lengths across DP ranks AFTER the pad above (which made len a
+            # multiple of max(world_size, mini_rows) ⊇ dp_size). Doing it here — not in
+            # _get_samples_from_queue, pre-pad — lets _balance_batch's equal_size=True seqlen
+            # partition see a DP-divisible row count, so it no longer asserts `len % dp_size != 0`
+            # on a variable/odd v3 per-step row count. Pad rows are already masked, so the
+            # reorder is loss-neutral.
+            if self.config.trainer.balance_batch:
+                self._balance_batch(batch, metrics=metrics)
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         return batch
 
