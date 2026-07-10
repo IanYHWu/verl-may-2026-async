@@ -47,6 +47,8 @@ class JudgeClient:
         retry_backoff_s: float = 2.0,
         max_concurrency: int = 32,
         max_tokens_param: str = "max_tokens",
+        sock_connect_s: Optional[float] = None,
+        sock_read_s: Optional[float] = None,
     ):
         if not endpoint_url:
             raise ValueError("endpoint_url is required")
@@ -62,6 +64,12 @@ class JudgeClient:
         self.timeout_s = timeout_s
         self.max_retries = max_retries
         self.retry_backoff_s = retry_backoff_s
+        # Opt-in fail-fast timeouts for a flapping/dropped connection. None => unset (legacy
+        # behaviour, e.g. the non-streaming judge). Streaming callers (the E fleet) set
+        # sock_read as an INTER-CHUNK idle bound, so a mid-stream tunnel drop aborts in
+        # seconds instead of hanging the whole `timeout_s`; a healthy SSE stream is untouched.
+        self.sock_connect_s = sock_connect_s
+        self.sock_read_s = sock_read_s
 
         api_key = os.environ.get(api_key_env, "")
         self._headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -81,7 +89,17 @@ class JudgeClient:
     async def _get_session(self) -> aiohttp.ClientSession:
         # Lazy init: aiohttp requires a running event loop at construction time.
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=self.timeout_s)
+            # total = full (streamed) generation budget. sock_connect/sock_read are opt-in
+            # (None => unset => legacy): set only by streaming callers (the E fleet) so a dead
+            # connect or a mid-stream tunnel drop (no bytes for sock_read) aborts fast -> the
+            # caller retries / fails over to a healthy sibling and the fleet breaker sees a
+            # timely signal, instead of a ~60min hang blocking a rollout group. Left None for
+            # the non-streaming judge so a long reward call is never cut short.
+            timeout = aiohttp.ClientTimeout(
+                total=self.timeout_s,
+                sock_connect=self.sock_connect_s,
+                sock_read=self.sock_read_s,
+            )
             # limit=0 (unlimited) so aiohttp's default TCPConnector cap of 100 does NOT
             # throttle concurrency below the semaphore. Without this, an ExternalEClient
             # with max_concurrency>100 (e.g. 1024) was silently capped at 100 concurrent
