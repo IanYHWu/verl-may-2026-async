@@ -227,9 +227,10 @@ class ActorConfig(BaseConfig):
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""
-        if self.train_minibatch_rows is not None and self.train_minibatch_rows <= 0:
+        if self.train_minibatch_rows is not None and self.train_minibatch_rows < 0:
             raise ValueError(
-                f"[actor] train_minibatch_rows ({self.train_minibatch_rows}) must be a positive integer"
+                f"[actor] train_minibatch_rows ({self.train_minibatch_rows}) must be >= 0 "
+                f"(0 = full-batch: one optimizer step over the whole batch, pad only to DP-divisibility)"
             )
         if not self.use_dynamic_bsz:
             if train_batch_size < self.ppo_mini_batch_size:
