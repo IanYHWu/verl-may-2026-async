@@ -13,7 +13,10 @@
 # limitations under the License.
 
 import asyncio
+import json
 import logging
+import os
+import pickle
 from collections import deque
 from typing import Any
 
@@ -21,6 +24,61 @@ import ray
 from omegaconf import DictConfig
 
 logger = logging.getLogger(__name__)
+
+# Filename of the message-queue snapshot inside a `global_step_{N}/` checkpoint dir.
+# Written next to verl's `actor/` and the rollouter's `data.pt` so a resume restores the
+# completed-but-untrained rollouts that were waiting in the queue at checkpoint time.
+QUEUE_FILENAME = "message_queue.pkl"
+
+
+def save_message_queue_snapshot(snapshot: dict, path: str, *, required_samples: int, max_queue_size: int) -> None:
+    """Persist a `MessageQueue.snapshot()` dict to `path`, atomically (`*.tmp` then
+    `os.replace`), plus a small `.meta.json` sidecar for the resume integrity check.
+
+    The samples are already cloudpickled `RolloutSample` bytes, so we just pickle the
+    list of blobs; the cheap counters/config go in the JSON sidecar so resume can
+    validate without unpickling the (potentially large) sample payload."""
+    samples = snapshot["samples"]
+    tmp = f"{path}.tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(samples, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
+
+    meta = {
+        "n_samples": len(samples),
+        "required_samples": int(required_samples),
+        "max_queue_size": int(max_queue_size),
+        "total_produced": snapshot.get("total_produced"),
+        "total_consumed": snapshot.get("total_consumed"),
+        "dropped_samples": snapshot.get("dropped_samples"),
+    }
+    meta_tmp = f"{path}.meta.json.tmp"
+    with open(meta_tmp, "w") as f:
+        json.dump(meta, f)
+    os.replace(meta_tmp, f"{path}.meta.json")
+
+
+def load_message_queue_snapshot(path: str) -> tuple[dict | None, dict | None]:
+    """Load a snapshot written by `save_message_queue_snapshot`. Returns
+    `(snapshot_dict, meta)`, or `(None, None)` when no snapshot exists at `path`
+    (old checkpoint, or snapshotting was disabled) — the caller then resumes with an
+    empty queue, exactly as before this feature."""
+    if not os.path.exists(path):
+        return None, None
+    meta_path = f"{path}.meta.json"
+    meta = {}
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+    with open(path, "rb") as f:
+        samples = pickle.load(f)
+    snapshot = {
+        "samples": samples,
+        "total_produced": meta.get("total_produced"),
+        "total_consumed": meta.get("total_consumed"),
+        "dropped_samples": meta.get("dropped_samples"),
+    }
+    return snapshot, meta
 
 
 @ray.remote(num_cpus=2, max_concurrency=20)
@@ -125,6 +183,35 @@ class MessageQueue:
             self.queue.clear()
             logger.info(f"Cleared {cleared_count} samples from queue")
 
+    async def snapshot(self) -> dict[str, Any]:
+        """Point-in-time copy of the queue for checkpointing. Returns the raw per-sample
+        blobs (already cloudpickled `RolloutSample` bytes) plus counters. Held under the
+        lock, so no `put`/`get` interleaves and the snapshot is internally consistent.
+        The `None` termination sentinel is excluded so a restore never poisons the
+        trainer with a premature stop signal."""
+        async with self._lock:
+            return {
+                "samples": [s for s in self.queue if s is not None],
+                "total_produced": self.total_produced,
+                "total_consumed": self.total_consumed,
+                "dropped_samples": self.dropped_samples,
+            }
+
+    async def restore(self, snapshot: dict[str, Any]) -> int:
+        """Repopulate the queue from a checkpoint `snapshot`, preserving FIFO order.
+        Called once during resume init before producers/consumers start, so there is no
+        contention — the lock is held only for consistency. `deque(maxlen=...)` drops the
+        oldest if the snapshot exceeds the current cap. Returns the number restored."""
+        async with self._lock:
+            samples = snapshot.get("samples", [])
+            self.queue.extend(samples)
+            for key in ("total_produced", "total_consumed", "dropped_samples"):
+                if snapshot.get(key) is not None:
+                    setattr(self, key, snapshot[key])
+            self._consumer_condition.notify_all()
+            print(f"[MessageQueue] restored {len(samples)} samples from checkpoint (queue_size={len(self.queue)})")
+            return len(samples)
+
     async def shutdown(self):
         """Shutdown the message queue"""
         async with self._lock:
@@ -214,6 +301,16 @@ class MessageQueueClient:
         """Clear queue (async)"""
         future = self.queue_actor.clear_queue.remote()
         await asyncio.wrap_future(future.future())
+
+    async def snapshot(self) -> dict[str, Any]:
+        """Snapshot the queue for checkpointing (async)"""
+        future = self.queue_actor.snapshot.remote()
+        return await asyncio.wrap_future(future.future())
+
+    def restore_sync(self, snapshot: dict[str, Any]) -> int:
+        """Restore a queue snapshot (sync — called from the rollouter's sync
+        load_checkpoint, before the event loop is serving producers/consumers)"""
+        return ray.get(self.queue_actor.restore.remote(snapshot))
 
     async def shutdown(self):
         """Shutdown queue (async)"""

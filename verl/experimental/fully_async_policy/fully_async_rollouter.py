@@ -325,11 +325,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         )
 
     async def save_checkpoint(self, local_global_step_folder: str):
-        # WARNING!: Due to the asynchronous nature, there are some in-flight samples
-        # (pending/cancel/result queue and message queue).
-        # Therefore, directly saving the state of the dataloader will result in losing these
-        # samples when resuming training.
-        # TODO: Implement dataloader recovery without losing in-flight samples.
+        # WARNING!: Due to the asynchronous nature, there are still some in-flight samples
+        # (pending/cancel/result queue) that are mid-generation and cannot be snapshotted.
+        # The message queue (completed-but-untrained samples) IS snapshotted below, so a
+        # resume no longer regenerates those rollouts from scratch.
         from verl.utils.fs import local_mkdir_safe
 
         # save dataloader
@@ -339,6 +338,24 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
         print(f"[FullyAsyncRollouter] Saved dataloader checkpoint to {dataloader_local_path}")
+
+        # Snapshot the message queue so a resume keeps the completed rollouts that were
+        # waiting to be trained. snapshot() holds the queue lock, so it is a consistent
+        # point-in-time capture even if generation is still running.
+        if self.config.async_training.get("save_queue_with_checkpoint", True):
+            from verl.experimental.fully_async_policy.message_queue import (
+                QUEUE_FILENAME,
+                save_message_queue_snapshot,
+            )
+
+            snap = await self.message_queue_client.snapshot()
+            save_message_queue_snapshot(
+                snap,
+                os.path.join(local_global_step_folder, QUEUE_FILENAME),
+                required_samples=self.required_samples,
+                max_queue_size=self.max_queue_size,
+            )
+            print(f"[FullyAsyncRollouter] Saved message queue snapshot ({len(snap['samples'])} samples)")
 
     def load_checkpoint(self):
         """Load checkpoint including dataloader state based on resume mode"""
@@ -397,6 +414,31 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 f"[FullyAsyncRollouter] Warning: No dataloader state found at {dataloader_local_path}, "
                 f"will start from scratch"
             )
+
+        # Restore the message queue snapshot saved alongside this checkpoint. Runs here in
+        # load_checkpoint (before fit()), so the restore happens while nothing produces or
+        # consumes yet — race-free. Absent snapshot → resume with an empty queue (old
+        # checkpoints / snapshotting disabled), matching pre-feature behavior.
+        if self.config.async_training.get("save_queue_with_checkpoint", True):
+            from verl.experimental.fully_async_policy.message_queue import (
+                QUEUE_FILENAME,
+                load_message_queue_snapshot,
+            )
+
+            queue_path = os.path.join(global_step_folder, QUEUE_FILENAME)
+            snap, meta = load_message_queue_snapshot(queue_path)
+            if snap is None:
+                print(f"[FullyAsyncRollouter] No message queue snapshot at {queue_path}; resuming with an empty queue")
+            else:
+                saved_req = meta.get("required_samples")
+                if saved_req is not None and saved_req != self.required_samples:
+                    print(
+                        f"[FullyAsyncRollouter] WARNING: message queue snapshot saved with "
+                        f"required_samples={saved_req} but this run has {self.required_samples}; "
+                        f"staleness accounting may differ."
+                    )
+                n = self.message_queue_client.restore_sync(snap)
+                print(f"[FullyAsyncRollouter] Restored {n} samples into the message queue from {queue_path}")
 
     def _validate_config(self):
         # Validate asynchronous training configuration
