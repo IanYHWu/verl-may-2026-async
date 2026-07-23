@@ -31,6 +31,17 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
+  # Snapshot the rollout message queue (completed-but-untrained samples) into each
+  # checkpoint dir and restore it on resume, so a resume doesn't regenerate those
+  # rollouts from scratch. In-flight (mid-decode) samples are still lost. A missing
+  # snapshot (old checkpoints) resumes with an empty queue.
+  save_queue_with_checkpoint: True
+
+  # Snapshot the INPUTS of in-flight/pending rollouts too, and re-dispatch them on resume, so
+  # problems that were mid-generation at checkpoint time are regenerated instead of skipped
+  # (their partial mid-decode state is still lost). A missing snapshot skips re-dispatch.
+  save_inflight_with_checkpoint: True
+
 # Rollout config
 rollout:
 

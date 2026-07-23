@@ -206,6 +206,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.pending_queue = asyncio.Queue(maxsize=128)
         self.active_tasks = set()
 
+        # In-flight sample re-dispatch on resume (async_training.save_inflight_with_checkpoint).
+        # _inflight_inputs maps sample_id -> {"epoch", "full_batch"(input DataProto)} for every
+        # dispatched-but-not-completed problem, so save_checkpoint can snapshot their inputs and a
+        # resume re-generates them (mid-decode state is unavoidably lost). _resumed_inflight holds
+        # the ones loaded from the resumed checkpoint, drained by _feed_samples before new data.
+        self._save_inflight: bool = config.async_training.get("save_inflight_with_checkpoint", True)
+        self._inflight_inputs: dict = {}
+        self._resumed_inflight: list = []
+
         cpu_cores = multiprocessing.cpu_count()
         # cpu case use cpu_cores; io case use cpu_cores*2
         self.validate_executor = ThreadPoolExecutor(max_workers=cpu_cores)
@@ -325,20 +334,74 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         )
 
     async def save_checkpoint(self, local_global_step_folder: str):
-        # WARNING!: Due to the asynchronous nature, there are some in-flight samples
-        # (pending/cancel/result queue and message queue).
-        # Therefore, directly saving the state of the dataloader will result in losing these
-        # samples when resuming training.
-        # TODO: Implement dataloader recovery without losing in-flight samples.
+        # Async checkpoint. Alongside the actor/critic weights (written by the trainer) the
+        # rollouter persists three things so a resume loses as little rollout work as possible:
+        #   - the dataloader position (data.pt),
+        #   - the message queue: completed-but-untrained samples (message_queue.pkl),
+        #   - the INPUTS of in-flight/pending samples (inflight_samples.pt) so a resume
+        #     re-dispatches them instead of silently skipping (the cursor is already past them).
+        # Only truly un-serializable mid-decode state is lost; its problem is regenerated.
         from verl.utils.fs import local_mkdir_safe
 
-        # save dataloader
+        # save dataloader + capture the in-flight inputs ATOMICALLY with the cursor (both sync,
+        # no await between them) so the snapshot is consistent with the saved dataloader position.
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         async with self.dataloader_lock:
             dataloader_state_dict = self.train_dataloader.state_dict()
+            inflight_records = (
+                [{"sample_id": sid, "epoch": v["epoch"], "full_batch": v["full_batch"]}
+                 for sid, v in self._inflight_inputs.items()]
+                if self._save_inflight else []
+            )
         torch.save(dataloader_state_dict, dataloader_local_path)
         print(f"[FullyAsyncRollouter] Saved dataloader checkpoint to {dataloader_local_path}")
+
+        # Snapshot the message queue so a resume keeps the completed rollouts that were
+        # waiting to be trained. snapshot() holds the queue lock, so it is a consistent
+        # point-in-time capture even if generation is still running. Best-effort: a
+        # snapshot failure (e.g. disk full) must not abort the checkpoint — the weights
+        # are already written, and a missing snapshot just re-generates the queue.
+        if self.config.async_training.get("save_queue_with_checkpoint", True):
+            try:
+                from verl.experimental.fully_async_policy.message_queue import (
+                    QUEUE_FILENAME,
+                    save_message_queue_snapshot,
+                )
+
+                snap = await self.message_queue_client.snapshot()
+                save_message_queue_snapshot(
+                    snap,
+                    os.path.join(local_global_step_folder, QUEUE_FILENAME),
+                    required_samples=self.required_samples,
+                    max_queue_size=self.max_queue_size,
+                )
+                print(f"[FullyAsyncRollouter] Saved message queue snapshot ({len(snap['samples'])} samples)")
+            except Exception as e:
+                print(
+                    f"[FullyAsyncRollouter] WARNING: message queue snapshot failed ({e}); "
+                    f"keeping the weights-only checkpoint, resume will regenerate the queue"
+                )
+
+        # Snapshot the in-flight/pending sample INPUTS (captured above, before the queue await,
+        # so a sample that completes in between is re-dispatched or restored — never lost).
+        # Best-effort: a failure just falls back to skipping those problems on resume.
+        if self._save_inflight:
+            try:
+                from verl.experimental.fully_async_policy.inflight_checkpoint import (
+                    INFLIGHT_FILENAME,
+                    save_inflight_snapshot,
+                )
+
+                save_inflight_snapshot(
+                    inflight_records, os.path.join(local_global_step_folder, INFLIGHT_FILENAME)
+                )
+                print(f"[FullyAsyncRollouter] Saved {len(inflight_records)} in-flight sample inputs for re-dispatch")
+            except Exception as e:
+                print(
+                    f"[FullyAsyncRollouter] WARNING: in-flight snapshot failed ({e}); "
+                    f"those problems will be skipped on resume"
+                )
 
     def load_checkpoint(self):
         """Load checkpoint including dataloader state based on resume mode"""
@@ -397,6 +460,65 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 f"[FullyAsyncRollouter] Warning: No dataloader state found at {dataloader_local_path}, "
                 f"will start from scratch"
             )
+
+        # Restore the message queue snapshot saved alongside this checkpoint. Runs here in
+        # load_checkpoint (before fit()), so the restore happens while nothing produces or
+        # consumes yet — race-free. Absent/corrupt snapshot → resume with an empty queue
+        # (old checkpoints / snapshotting disabled), matching pre-feature behavior. Wrapped
+        # so a restore failure can never brick a resume — the whole point is resilience.
+        if self.config.async_training.get("save_queue_with_checkpoint", True):
+            try:
+                from verl.experimental.fully_async_policy.message_queue import (
+                    QUEUE_FILENAME,
+                    load_message_queue_snapshot,
+                )
+
+                queue_path = os.path.join(global_step_folder, QUEUE_FILENAME)
+                snap, meta = load_message_queue_snapshot(queue_path)
+                if snap is None:
+                    print(
+                        f"[FullyAsyncRollouter] No message queue snapshot at {queue_path}; "
+                        f"resuming with an empty queue"
+                    )
+                else:
+                    saved_req = meta.get("required_samples")
+                    saved_max = meta.get("max_queue_size")
+                    if (saved_req is not None and saved_req != self.required_samples) or (
+                        saved_max is not None and saved_max != self.max_queue_size
+                    ):
+                        print(
+                            f"[FullyAsyncRollouter] WARNING: message queue snapshot saved with "
+                            f"required_samples={saved_req}, max_queue_size={saved_max} but this run "
+                            f"has {self.required_samples}, {self.max_queue_size}; staleness/capacity "
+                            f"accounting may differ (oldest samples over the new cap are dropped)."
+                        )
+                    n = self.message_queue_client.restore_sync(snap)
+                    print(f"[FullyAsyncRollouter] Restored {n} samples into the message queue from {queue_path}")
+            except Exception as e:
+                print(
+                    f"[FullyAsyncRollouter] WARNING: message queue restore failed ({e}); "
+                    f"resuming with an empty queue"
+                )
+
+        # Load the in-flight sample inputs to re-dispatch. _feed_samples drains
+        # self._resumed_inflight before the normal dataloader stream, so these problems are
+        # regenerated (not skipped). Absent/corrupt file → nothing to re-dispatch.
+        if self._save_inflight:
+            try:
+                from verl.experimental.fully_async_policy.inflight_checkpoint import (
+                    INFLIGHT_FILENAME,
+                    load_inflight_snapshot,
+                )
+
+                records = load_inflight_snapshot(os.path.join(global_step_folder, INFLIGHT_FILENAME))
+                if records:
+                    self._resumed_inflight = records
+                    print(f"[FullyAsyncRollouter] Loaded {len(records)} in-flight sample inputs to re-dispatch")
+            except Exception as e:
+                print(
+                    f"[FullyAsyncRollouter] WARNING: in-flight restore failed ({e}); "
+                    f"those problems will be skipped"
+                )
 
     def _validate_config(self):
         # Validate asynchronous training configuration
@@ -483,6 +605,21 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     # Add samples to the pending_queue
     async def _feed_samples(self):
+        # Re-dispatch problems that were in flight at the checkpoint we resumed from, so they are
+        # regenerated instead of silently skipped (the dataloader cursor is already past them).
+        # sample_id is re-keyed ("resumed_") so uids can't collide with this run's fresh feeds.
+        for rec in self._resumed_inflight:
+            sample_id = f"resumed_{rec['sample_id']}"
+            rollout_sample = RolloutSample(
+                full_batch=rec["full_batch"], sample_id=sample_id, epoch=rec["epoch"], rollout_status={}
+            )
+            if self._save_inflight:
+                self._inflight_inputs[sample_id] = {"epoch": rec["epoch"], "full_batch": rec["full_batch"]}
+            await self.pending_queue.put(rollout_sample)
+        if self._resumed_inflight:
+            print(f"[FullyAsyncRollouter][Feed] re-dispatched {len(self._resumed_inflight)} in-flight samples from resume")
+        self._resumed_inflight = []
+
         continuous_iterator = self._create_continuous_iterator()
 
         for epoch, batch_dict in continuous_iterator:
@@ -497,6 +634,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 epoch=epoch,
                 rollout_status={},
             )
+
+            if self._save_inflight:
+                self._inflight_inputs[sample_id] = {"epoch": epoch, "full_batch": full_batch}
 
             await self.pending_queue.put(rollout_sample)
 
@@ -613,6 +753,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         success = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),
         )
+        # Completed → no longer in flight (it is now in the message queue). Safe if absent.
+        self._inflight_inputs.pop(rollout_sample.sample_id, None)
         if success:
             self.total_generated_samples += 1
         else:

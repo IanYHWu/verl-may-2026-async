@@ -322,6 +322,44 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.partial_rollout="${partial_rollout}"
 ```
 
+### Checkpoint & Resume
+
+At each `save_freq` (param-version) boundary the trainer writes `global_step_{N}/` containing the actor
+(and critic) weights + optimizer state, and the rollouter contributes three files:
+
+- **`data.pt`** — the rollouter's `StatefulDataLoader` position (which problems have been dispatched).
+- **`message_queue.pkl`** — a snapshot of the `MessageQueue`: the completed-but-untrained `RolloutSample`s
+  that were waiting for the trainer. Controlled by `async_training.save_queue_with_checkpoint` (default
+  `True`). The samples are already cloudpickled, so they are persisted as-is (atomic write + a
+  `.meta.json` sidecar carrying `required_samples` / `max_queue_size` for a resume sanity check).
+- **`inflight_samples.pt`** — the *inputs* of the in-flight (`active_tasks`) and `pending_queue` rollouts:
+  problems that were dispatched but had not finished generating. Controlled by
+  `async_training.save_inflight_with_checkpoint` (default `True`). Captured atomically with `data.pt` (both
+  under the dataloader lock, before the queue snapshot) so a sample that completes in between is either
+  restored from the queue or re-dispatched — never lost.
+
+On resume (`trainer.resume_mode=auto|resume_path`) all three are reloaded in `load_checkpoint`, which runs
+for the trainer and then the rollouter **before** either `fit()` starts — so restore happens while no
+producer or consumer is running (race-free). Two things then keep the dataloader consistent:
+
+- **Completed rollouts** (the queue) are restored as-is. They sit *behind* the saved dataloader cursor, so
+  the resumed dataloader will not re-emit them — the restored queue is their only source (exactly-once).
+- **In-flight/pending problems** are **re-dispatched**: `_feed_samples` drains the loaded inputs into the
+  pipeline (with re-keyed `sample_id`s so uids can't collide with fresh feeds) before resuming the normal
+  dataloader stream, so those problems are **regenerated from scratch**. A partially-finished parallel
+  group is redone as a whole — the GRPO group is atomic (advantages need all `n` branches), so partial
+  branch progress is never enqueued and never preserved.
+
+**What is lost:** only the *partial mid-decode compute* of the in-flight rollouts — the accumulated MR/E/FA
+state of a rollout that was decoding when the checkpoint was taken. Its problem is regenerated, but from
+scratch; the in-progress tokens / E fan-outs cannot be serialized. This is why the dataloader advancing at
+**dispatch** matters: without `inflight_samples.pt` those problems would sit behind the saved cursor and be
+silently skipped for the epoch.
+
+Both mechanisms are **best-effort** and can never block a checkpoint or a restart: a snapshot write failure
+leaves a valid weights-only checkpoint, and an absent, unreadable, or corrupt snapshot degrades to an empty
+queue / no re-dispatch (identical to pre-feature behavior and to `save_*_with_checkpoint=False`).
+
 ## Experiments
 
 ### Asynchronous Training on 7B Model
