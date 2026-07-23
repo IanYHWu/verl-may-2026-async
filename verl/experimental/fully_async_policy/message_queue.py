@@ -65,13 +65,17 @@ def load_message_queue_snapshot(path: str) -> tuple[dict | None, dict | None]:
     empty queue, exactly as before this feature."""
     if not os.path.exists(path):
         return None, None
-    meta_path = f"{path}.meta.json"
-    meta = {}
-    if os.path.exists(meta_path):
-        with open(meta_path) as f:
-            meta = json.load(f)
-    with open(path, "rb") as f:
-        samples = pickle.load(f)
+    try:
+        meta_path = f"{path}.meta.json"
+        meta = {}
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+        with open(path, "rb") as f:
+            samples = pickle.load(f)
+    except Exception as e:  # corrupt / truncated / unreadable — degrade to an empty queue
+        print(f"[MessageQueue] WARNING: could not read queue snapshot at {path} ({e}); resuming with an empty queue")
+        return None, None
     snapshot = {
         "samples": samples,
         "total_produced": meta.get("total_produced"),
@@ -201,16 +205,19 @@ class MessageQueue:
         """Repopulate the queue from a checkpoint `snapshot`, preserving FIFO order.
         Called once during resume init before producers/consumers start, so there is no
         contention — the lock is held only for consistency. `deque(maxlen=...)` drops the
-        oldest if the snapshot exceeds the current cap. Returns the number restored."""
+        oldest if the snapshot exceeds the current cap. Returns the number of samples now
+        in the queue (< len(snapshot) if it exceeded the cap)."""
         async with self._lock:
             samples = snapshot.get("samples", [])
+            self.queue.clear()  # restore replaces the queue (called once on a fresh queue)
             self.queue.extend(samples)
             for key in ("total_produced", "total_consumed", "dropped_samples"):
                 if snapshot.get(key) is not None:
                     setattr(self, key, snapshot[key])
             self._consumer_condition.notify_all()
-            print(f"[MessageQueue] restored {len(samples)} samples from checkpoint (queue_size={len(self.queue)})")
-            return len(samples)
+            restored = len(self.queue)
+            print(f"[MessageQueue] restored {restored} of {len(samples)} snapshot samples (queue_size={restored})")
+            return restored
 
     async def shutdown(self):
         """Shutdown the message queue"""

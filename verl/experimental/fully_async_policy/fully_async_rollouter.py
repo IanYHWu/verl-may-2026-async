@@ -341,21 +341,29 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # Snapshot the message queue so a resume keeps the completed rollouts that were
         # waiting to be trained. snapshot() holds the queue lock, so it is a consistent
-        # point-in-time capture even if generation is still running.
+        # point-in-time capture even if generation is still running. Best-effort: a
+        # snapshot failure (e.g. disk full) must not abort the checkpoint — the weights
+        # are already written, and a missing snapshot just re-generates the queue.
         if self.config.async_training.get("save_queue_with_checkpoint", True):
-            from verl.experimental.fully_async_policy.message_queue import (
-                QUEUE_FILENAME,
-                save_message_queue_snapshot,
-            )
+            try:
+                from verl.experimental.fully_async_policy.message_queue import (
+                    QUEUE_FILENAME,
+                    save_message_queue_snapshot,
+                )
 
-            snap = await self.message_queue_client.snapshot()
-            save_message_queue_snapshot(
-                snap,
-                os.path.join(local_global_step_folder, QUEUE_FILENAME),
-                required_samples=self.required_samples,
-                max_queue_size=self.max_queue_size,
-            )
-            print(f"[FullyAsyncRollouter] Saved message queue snapshot ({len(snap['samples'])} samples)")
+                snap = await self.message_queue_client.snapshot()
+                save_message_queue_snapshot(
+                    snap,
+                    os.path.join(local_global_step_folder, QUEUE_FILENAME),
+                    required_samples=self.required_samples,
+                    max_queue_size=self.max_queue_size,
+                )
+                print(f"[FullyAsyncRollouter] Saved message queue snapshot ({len(snap['samples'])} samples)")
+            except Exception as e:
+                print(
+                    f"[FullyAsyncRollouter] WARNING: message queue snapshot failed ({e}); "
+                    f"keeping the weights-only checkpoint, resume will regenerate the queue"
+                )
 
     def load_checkpoint(self):
         """Load checkpoint including dataloader state based on resume mode"""
@@ -417,28 +425,42 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # Restore the message queue snapshot saved alongside this checkpoint. Runs here in
         # load_checkpoint (before fit()), so the restore happens while nothing produces or
-        # consumes yet — race-free. Absent snapshot → resume with an empty queue (old
-        # checkpoints / snapshotting disabled), matching pre-feature behavior.
+        # consumes yet — race-free. Absent/corrupt snapshot → resume with an empty queue
+        # (old checkpoints / snapshotting disabled), matching pre-feature behavior. Wrapped
+        # so a restore failure can never brick a resume — the whole point is resilience.
         if self.config.async_training.get("save_queue_with_checkpoint", True):
-            from verl.experimental.fully_async_policy.message_queue import (
-                QUEUE_FILENAME,
-                load_message_queue_snapshot,
-            )
+            try:
+                from verl.experimental.fully_async_policy.message_queue import (
+                    QUEUE_FILENAME,
+                    load_message_queue_snapshot,
+                )
 
-            queue_path = os.path.join(global_step_folder, QUEUE_FILENAME)
-            snap, meta = load_message_queue_snapshot(queue_path)
-            if snap is None:
-                print(f"[FullyAsyncRollouter] No message queue snapshot at {queue_path}; resuming with an empty queue")
-            else:
-                saved_req = meta.get("required_samples")
-                if saved_req is not None and saved_req != self.required_samples:
+                queue_path = os.path.join(global_step_folder, QUEUE_FILENAME)
+                snap, meta = load_message_queue_snapshot(queue_path)
+                if snap is None:
                     print(
-                        f"[FullyAsyncRollouter] WARNING: message queue snapshot saved with "
-                        f"required_samples={saved_req} but this run has {self.required_samples}; "
-                        f"staleness accounting may differ."
+                        f"[FullyAsyncRollouter] No message queue snapshot at {queue_path}; "
+                        f"resuming with an empty queue"
                     )
-                n = self.message_queue_client.restore_sync(snap)
-                print(f"[FullyAsyncRollouter] Restored {n} samples into the message queue from {queue_path}")
+                else:
+                    saved_req = meta.get("required_samples")
+                    saved_max = meta.get("max_queue_size")
+                    if (saved_req is not None and saved_req != self.required_samples) or (
+                        saved_max is not None and saved_max != self.max_queue_size
+                    ):
+                        print(
+                            f"[FullyAsyncRollouter] WARNING: message queue snapshot saved with "
+                            f"required_samples={saved_req}, max_queue_size={saved_max} but this run "
+                            f"has {self.required_samples}, {self.max_queue_size}; staleness/capacity "
+                            f"accounting may differ (oldest samples over the new cap are dropped)."
+                        )
+                    n = self.message_queue_client.restore_sync(snap)
+                    print(f"[FullyAsyncRollouter] Restored {n} samples into the message queue from {queue_path}")
+            except Exception as e:
+                print(
+                    f"[FullyAsyncRollouter] WARNING: message queue restore failed ({e}); "
+                    f"resuming with an empty queue"
+                )
 
     def _validate_config(self):
         # Validate asynchronous training configuration

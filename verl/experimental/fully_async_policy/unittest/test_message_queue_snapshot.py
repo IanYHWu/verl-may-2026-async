@@ -57,6 +57,27 @@ def test_load_missing_snapshot_returns_none(tmp_path):
     assert meta is None
 
 
+def test_load_corrupt_snapshot_degrades_to_none(tmp_path):
+    # A truncated / garbage .pkl must not raise (would brick a resume) — degrade to empty.
+    path = str(tmp_path / QUEUE_FILENAME)
+    with open(path, "wb") as f:
+        f.write(b"not a valid pickle stream")
+    loaded, meta = load_message_queue_snapshot(path)
+    assert loaded is None
+    assert meta is None
+
+
+def test_load_snapshot_missing_meta_sidecar(tmp_path):
+    # Samples present but the .meta.json is gone: still load the samples (meta empty).
+    blobs = [pickle.dumps({"i": i}) for i in range(3)]
+    path = str(tmp_path / QUEUE_FILENAME)
+    save_message_queue_snapshot({"samples": blobs}, path, required_samples=2, max_queue_size=5)
+    os.remove(f"{path}.meta.json")
+    loaded, meta = load_message_queue_snapshot(path)
+    assert loaded["samples"] == blobs
+    assert meta == {}
+
+
 def test_queue_actor_snapshot_restore_roundtrip(tmp_path):
     ray = pytest.importorskip("ray")
     os.environ.pop("RAY_ADDRESS", None)  # never attach to a shared cluster from a unit test
@@ -89,5 +110,13 @@ def test_queue_actor_snapshot_restore_roundtrip(tmp_path):
         out, remaining = ray.get(q2.get_sample.remote())
         assert out == blobs[0]
         assert remaining == 4
+
+        # Overflow: restoring more than the cap keeps the NEWEST (drops oldest), FIFO.
+        q3 = MessageQueue.remote(cfg, 3)
+        big = [pickle.dumps({"j": j}) for j in range(6)]
+        assert ray.get(q3.restore.remote({"samples": big})) == 3  # actual landed count
+        assert ray.get(q3.get_queue_size.remote()) == 3
+        first, _ = ray.get(q3.get_sample.remote())
+        assert first == big[3]  # the 3 oldest were dropped, big[3:] kept in order
     finally:
         ray.shutdown()
