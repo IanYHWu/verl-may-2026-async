@@ -322,6 +322,36 @@ python -m recipe.fully_async_policy.fully_async_main \
     async_training.partial_rollout="${partial_rollout}"
 ```
 
+### Checkpoint & Resume
+
+At each `save_freq` (param-version) boundary the trainer writes `global_step_{N}/` containing the actor
+(and critic) weights + optimizer state, and the rollouter contributes two files:
+
+- **`data.pt`** — the rollouter's `StatefulDataLoader` position (which problems have been dispatched).
+- **`message_queue.pkl`** — a snapshot of the `MessageQueue`: the completed-but-untrained `RolloutSample`s
+  that were waiting for the trainer. Controlled by `async_training.save_queue_with_checkpoint` (default
+  `True`). The samples are already cloudpickled, so they are persisted as-is (atomic write + a
+  `.meta.json` sidecar carrying `required_samples` / `max_queue_size` for a resume sanity check).
+
+On resume (`trainer.resume_mode=auto|resume_path`) both are reloaded in `load_checkpoint`, which runs for
+the trainer and then the rollouter **before** either `fit()` starts — so the queue is restored while no
+producer or consumer is running (race-free). Restoring the queue means a restart continues training on the
+already-generated rollouts instead of regenerating them, and it keeps the dataloader consistent: those
+queued samples sit *behind* the saved dataloader cursor, so the resumed dataloader will not re-emit them —
+the restored queue is their only source (exactly-once).
+
+**What is not preserved.** Rollouts still mid-generation at save time (the `active_tasks`) and the
+`pending_queue` backlog are *not* snapshotted. Because the dataloader advances at **dispatch** (a problem
+is pulled the moment it is fed to generation, not when it is trained), its saved cursor is already past
+those problems; on resume the dataloader emits only problems *after* the cursor, so the in-flight/pending
+problems are **skipped for the current epoch** (re-seen only if a later epoch runs over the dataset) —
+they are not regenerated in place. This is bounded by the pending backlog + in-flight concurrency and is
+the intended limit (mid-decode state cannot be serialized).
+
+Queue persistence is **best-effort** and can never block a checkpoint or a restart: a snapshot write
+failure leaves a valid weights-only checkpoint, and an absent, unreadable, or corrupt snapshot resumes
+with an empty queue (identical to pre-feature behavior and to `save_queue_with_checkpoint=False`).
+
 ## Experiments
 
 ### Asynchronous Training on 7B Model
