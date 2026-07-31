@@ -2417,6 +2417,11 @@ def compute_policy_loss_bypass_mode(
             "rollout_correction config not found in policy_loss. "
             "When using loss_mode='bypass_mode', ensure rollout_correction config is passed."
         )
+    if not rollout_corr_config.get("bypass_mode", False):
+        raise ValueError(
+            "loss_mode='bypass_mode' requires algorithm.rollout_correction.bypass_mode=true; "
+            "the wrapper assumes old_log_prob is rollout_log_prob."
+        )
 
     # Extract parameters
     loss_type = rollout_corr_config.get("loss_type", "ppo_clip")

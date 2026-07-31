@@ -1110,11 +1110,13 @@ def apply_bypass_mode(
     Bypass mode skips expensive actor forward pass for old_log_prob computation
     by setting old_log_probs = rollout_log_probs (2 policies instead of 3).
 
-    Uses compute_policy_loss_bypass_mode() which supports:
-    - loss_type="ppo_clip" (default): PPO clipped objective (IS handled by ratio)
-    - loss_type="reinforce": REINFORCE with explicit IS weights
+    The policy objective is selected independently through
+    ``actor.policy_loss.loss_mode``. For example, ``vanilla`` uses the PPO/GRPO
+    objective and ``cispo`` uses CISPO, with both objectives receiving
+    ``old_log_probs = rollout_log_probs``.
 
-    Both loss types benefit from rejection sampling (RS) which masks out-of-distribution samples.
+    The legacy ``bypass_mode`` policy loss remains available when explicitly
+    selected for its REINFORCE/rollout-correction behavior.
 
     Note:
         The implementation is copied from szrlee <szrlee@gmail.com>.
@@ -1131,7 +1133,7 @@ def apply_bypass_mode(
     batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
 
     with open_dict(policy_loss_config):
-        # Pass rollout_correction config to actor for loss computation and metrics
+        # Pass rollout_correction config to an explicitly selected bypass_mode
+        # policy loss. Do not overwrite loss_mode here: choosing the old-policy
+        # source and choosing the policy objective are independent decisions.
         policy_loss_config["rollout_correction"] = rollout_corr_config
-        # Always use bypass_mode loss function which handles both loss_types
-        policy_loss_config["loss_mode"] = "bypass_mode"

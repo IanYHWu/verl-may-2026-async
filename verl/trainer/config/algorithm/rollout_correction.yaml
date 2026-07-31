@@ -16,10 +16,14 @@ rollout_rs: null
 # Threshold for rejection sampling (string or float; see code docs)
 rollout_rs_threshold: null
 
-# Operating mode: false = Decoupled (3 policies), true = Bypass (2 policies)
+# Old-policy anchor: false = Decoupled (3 policies), true = Bypass (2 policies).
+# This is independent of actor.policy_loss.loss_mode.
 bypass_mode: false
 
-# Loss type in bypass mode (bypass_mode=true):
+# Loss type for the legacy actor policy_loss.loss_mode=bypass_mode wrapper.
+# For compatibility, loss_type=reinforce or active IS/RS settings select that
+# wrapper when the actor loss is still the default vanilla. Explicit objectives
+# such as CISPO are never overwritten.
 # - "ppo_clip": PPO clipped objective (IS handled by ratio, default)
 # - "reinforce": REINFORCE with explicit IS weights (no PPO clipping)
 loss_type: ppo_clip

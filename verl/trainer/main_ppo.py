@@ -56,6 +56,16 @@ def run_ppo(config, task_runner_class=None) -> None:
                 model paths, and training hyperparameters.
         task_runner_class: For recipe to change TaskRunner.
     """
+    # Validate and normalize the configuration on the driver before any task
+    # runner can initialize actor workers. Custom runners (including the fully
+    # async runner) do not necessarily inherit TaskRunner.run(), so validation
+    # cannot live only in that implementation.
+    validate_config(
+        config=config,
+        use_reference_policy=need_reference_policy(config),
+        use_critic=need_critic(config),
+    )
+
     # Check if Ray is not initialized
     if not ray.is_initialized():
         # Initialize Ray with a local cluster configuration
@@ -248,13 +258,6 @@ class TaskRunner:
 
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
-
-        # validate config
-        validate_config(
-            config=config,
-            use_reference_policy=need_reference_policy(config),
-            use_critic=need_critic(config),
-        )
 
         # Download the checkpoint from HDFS to the local machine.
         # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
