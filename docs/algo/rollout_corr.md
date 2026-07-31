@@ -293,10 +293,16 @@ The rollout correction framework is built from **orthogonal components** that ca
    - **Decoupled**: Three policies (π_rollout, π_old, π_θ) with separate π_old computation
    - **Bypass**: Two policies (π_rollout = π_old, π_θ), skips π_old computation
 
-2. **Loss Function** (in bypass mode, controlled by `loss_type`)
+2. **Policy objective**
 
-   - **PPO-clip** (`loss_type="ppo_clip"`, default): PPO clipped objective (IS handled by ratio)
-   - **REINFORCE** (`loss_type="reinforce"`): Policy gradient with explicit IS weights (no clipping)
+   - Selected independently with `actor_rollout_ref.actor.policy_loss.loss_mode`
+     (for example, `vanilla` or `cispo`).
+   - The legacy `bypass_mode` policy-loss wrapper uses `loss_type="ppo_clip"`
+     or `loss_type="reinforce"`.
+   - For compatibility, active bypass IS/RS settings or
+     `loss_type="reinforce"` select that legacy wrapper when the actor objective
+     is still the default `vanilla`. Explicit objectives such as CISPO are
+     never overwritten.
 
 3. **IS/RS Aggregation Level**
    - **Token**: Per-token IS weights/rejection
@@ -338,9 +344,13 @@ This section provides detailed guidance on choosing and using the verified prese
 
 **Note:**
 
-- **Bypass mode** sets π_old = π_rollout and uses `loss_type` to select the loss function:
+- **Bypass mode** sets π_old = π_rollout independently of the policy objective.
+- The legacy `policy_loss.loss_mode="bypass_mode"` wrapper uses `loss_type` to select:
   - `"ppo_clip"` (default): PPO clipped objective where ratio = π_θ/π_rollout already handles IS
   - `"reinforce"`: REINFORCE with explicit IS weights as π_θ/π_rollout
+- Presets with active IS/RS or REINFORCE retain their legacy behavior through
+  startup compatibility resolution. A bare `bypass_mode: true` does not
+  replace `vanilla` or `cispo`.
 - Both loss types benefit from rejection sampling (RS) which masks out-of-distribution samples.
 - All estimators (Token-TIS, Seq-TIS, Seq-MIS, Geo-RS, ...) are compatible with Decoupled and Bypass modes.
 
@@ -690,11 +700,12 @@ The framework provides **two operating modes** for computing π_old, which can b
 - π_old = π_rollout: Proximal policy equals behavior policy
 - π_θ: Current policy (being updated)
 
-**Configuration:** `bypass_mode = true`
+**Configuration:** `algorithm.rollout_correction.bypass_mode = true`
 
 **Properties:**
 
 - ✅ Skips `actor.compute_log_prob()` call (faster)
+- ✅ Works with independently selected vanilla PPO/GRPO or CISPO objectives
 - ✅ Handles off-policy correction via IS/RS (when using policy gradient with IS/RS)
 - ✅ Uses two policies instead of three (π_rollout = π_old)
 - ⚠️ Does not separate proximal policy from behavior policy (unlike decoupled mode)
@@ -769,7 +780,8 @@ This workflow uses bypass mode for efficiency.
 **Benefits of bypass mode:**
 
 - ✅ Skips expensive `actor.compute_log_prob()` forward pass (faster)
-- ✅ `loss_type` controls the loss function: "ppo_clip" (default) or "reinforce"
+- ✅ The actor policy objective remains independently selectable
+- ✅ In the legacy bypass wrapper, `loss_type` controls "ppo_clip" or "reinforce"
 - ✅ PPO-clip: IS handled by ratio (no explicit weights), RS mask applied
 - ✅ REINFORCE: Explicit IS weights computed on-the-fly (π_θ / π_rollout)
 - ✅ Both loss types work with all IS/RS combinations
@@ -793,8 +805,12 @@ actor_rollout_ref:
 ### Additional Configurations for Bypass Mode
 
 - Set `actor_rollout_ref.actor.use_rollout_log_probs: true`
-- Set `actor_rollout_ref.actor.policy_loss.loss_mode: bypass_mode`
-- Set rollout correction config via `actor_rollout_ref.actor.policy_loss.rollout_correction`
+- Choose `actor_rollout_ref.actor.policy_loss.loss_mode` independently
+  (`vanilla`, `cispo`, or the legacy `bypass_mode` wrapper).
+- Configure rollout correction under `algorithm.rollout_correction`; startup
+  validation copies it into the actor config when the legacy wrapper needs it.
+- `policy_loss.loss_mode: bypass_mode` with algorithm bypass disabled is invalid
+  and fails before worker initialization.
 
 ### Metrics
 

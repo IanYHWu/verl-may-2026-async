@@ -15,7 +15,7 @@
 from dataclasses import is_dataclass
 from typing import Any, Optional
 
-from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 
 __all__ = ["omega_conf_to_dataclass", "validate_config"]
 
@@ -69,6 +69,57 @@ def update_dict_with_config(dictionary: dict, config: DictConfig):
     for key in dictionary:
         if hasattr(config, key):
             dictionary[key] = getattr(config, key)
+
+
+def _validate_policy_loss_rollout_correction(config: DictConfig) -> None:
+    """Validate policy-loss and rollout-correction combinations.
+
+    ``policy_loss.loss_mode=bypass_mode`` is a legacy wrapper which assumes
+    ``old_log_probs`` came from the rollout policy. It is therefore only valid
+    when algorithm-level bypass mode makes that substitution.
+
+    Older rollout-correction presets select the legacy wrapper indirectly via
+    ``loss_type`` and active IS/RS settings. Preserve that API before actor
+    workers are initialized, while leaving a plain bypass anchor independent
+    from explicitly selected objectives such as vanilla PPO/GRPO and CISPO.
+    """
+    policy_loss_config = config.actor_rollout_ref.actor.policy_loss
+    policy_loss_mode = policy_loss_config.get("loss_mode", "vanilla")
+    rollout_corr_config = config.algorithm.get("rollout_correction", None)
+    algorithm_bypass_mode = bool(
+        rollout_corr_config is not None and rollout_corr_config.get("bypass_mode", False)
+    )
+
+    legacy_bypass_loss_requested = bool(
+        algorithm_bypass_mode
+        and policy_loss_mode == "vanilla"
+        and (
+            rollout_corr_config.get("loss_type", "ppo_clip") != "ppo_clip"
+            or rollout_corr_config.get("rollout_is", None) is not None
+            or rollout_corr_config.get("rollout_rs", None) is not None
+        )
+    )
+    if legacy_bypass_loss_requested:
+        # Compatibility for RolloutCorrectionConfig.bypass_pg_* and bypass
+        # PPO+RS/IS presets. A bare bypass_mode=true with no correction keeps
+        # vanilla PPO/GRPO, and an explicit non-vanilla objective is untouched.
+        with open_dict(policy_loss_config):
+            policy_loss_config["loss_mode"] = "bypass_mode"
+        policy_loss_mode = "bypass_mode"
+
+    if policy_loss_mode == "bypass_mode" and not algorithm_bypass_mode:
+        raise ValueError(
+            "actor_rollout_ref.actor.policy_loss.loss_mode='bypass_mode' requires "
+            "algorithm.rollout_correction.bypass_mode=true because the loss wrapper "
+            "assumes old_log_probs are rollout_log_probs. Use loss_mode='vanilla' or "
+            "'cispo' when algorithm bypass mode is disabled."
+        )
+
+    if policy_loss_mode == "bypass_mode":
+        # The wrapper executes inside actor workers, so copy the algorithm-level
+        # settings into the actor config before workers are initialized.
+        with open_dict(policy_loss_config):
+            policy_loss_config["rollout_correction"] = rollout_corr_config
 
 
 def validate_config(
@@ -147,6 +198,7 @@ def validate_config(
                 )
 
     # Actor validation done in ActorConfig.__post_init__ and validate()
+    _validate_policy_loss_rollout_correction(config)
     actor_config = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
     actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
 

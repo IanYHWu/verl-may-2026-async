@@ -122,12 +122,17 @@ class RolloutCorrectionConfig(BaseConfig):
 
         bypass_mode (bool): Operating mode - bypass or decoupled.
             - True: Bypass mode - reuse rollout_log_prob as old_log_prob (2 policies)
-              Uses compute_policy_loss_bypass_mode() with loss_type selection
             - False: Decoupled mode - compute old_log_prob separately (3 policies)
-              Uses standard PPO loss with IS weight correction
+            This selects the old-policy anchor independently of
+            ``actor.policy_loss.loss_mode``. For backward compatibility, active
+            legacy IS/RS settings or ``loss_type="reinforce"`` select the
+            ``bypass_mode`` policy-loss wrapper when the actor loss is otherwise
+            the default ``vanilla``.
             Default: False (decoupled mode)
 
         loss_type (str): Loss function type in bypass mode (bypass_mode=True).
+            Used by the legacy ``policy_loss.loss_mode="bypass_mode"`` wrapper;
+            it does not override explicitly selected objectives such as CISPO.
             - "reinforce": REINFORCE-style policy gradient with explicit IS weights
               L = -E[w * log π(a|s) * A] where w = π_current / π_rollout
             - "ppo_clip": PPO clipped objective (IS handled by ratio, no explicit weights)
@@ -146,7 +151,8 @@ class RolloutCorrectionConfig(BaseConfig):
         config = RolloutCorrectionConfig.decoupled_geo_rs()    # Geo-RS (ratio mode)
 
         # Bypass mode presets (2 policies: π_rollout = π_old, π_θ)
-        # loss_type controls the loss function
+        # Active legacy IS/RS settings and loss_type="reinforce" select the
+        # bypass_mode policy-loss wrapper when actor loss is vanilla.
         # PPO-clip presets (ratio handles IS, so no separate IS weights needed):
         config = RolloutCorrectionConfig.bypass_ppo_clip()              # PPO-clip only
         config = RolloutCorrectionConfig.bypass_ppo_clip_geo_rs()       # PPO-clip + Geo-RS
