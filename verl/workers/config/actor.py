@@ -234,7 +234,11 @@ class ActorConfig(BaseConfig):
                 f"(0 = full-batch: one optimizer step over the whole batch, pad only to DP-divisibility)"
             )
         if not self.use_dynamic_bsz:
-            if train_batch_size < self.ppo_mini_batch_size:
+            # FullyAsyncRollouter requires train_batch_size=0 as a sentinel: it
+            # streams one prompt at a time and forms optimizer batches from its
+            # message queue. The ordinary non-zero batch-size relationship does
+            # not apply in that mode.
+            if train_batch_size != 0 and train_batch_size < self.ppo_mini_batch_size:
                 raise ValueError(
                     f"train_batch_size ({train_batch_size}) must be >= "
                     f"actor.ppo_mini_batch_size ({self.ppo_mini_batch_size})"
