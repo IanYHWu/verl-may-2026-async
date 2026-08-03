@@ -18,6 +18,7 @@ import os
 import platform
 import signal
 import threading
+from collections.abc import Mapping, Sequence
 from types import MethodType
 from typing import Any, Literal, Optional, get_args
 
@@ -26,6 +27,9 @@ from vllm.outputs import RequestOutput
 
 from verl.utils.device import is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
+from verl.utils.vllm.generation_head_dtype import (
+    apply_vllm_generation_head_dtype_patch,
+)
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
 
@@ -120,6 +124,9 @@ class vLLMColocateWorkerExtension:
     def __new__(cls, **kwargs):
         set_death_signal()
 
+        # Engine-core workers may be spawned, so controller-process monkey
+        # patches are not sufficient. This must run before model construction.
+        apply_vllm_generation_head_dtype_patch()
         # 1. patch for Lora
         VLLMHijack.hijack()
         # 2. patch online fp8 quant
@@ -282,9 +289,9 @@ def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
     - None: skipped
     - bool True: adds '--key'
     - bool False: skipped
-    - list: expands to '--key item1 item2 ...'
-    - empty list: skipped (vLLM uses nargs="+" which requires at least one value)
-    - dict: JSON serialized
+    - sequence: expands to '--key item1 item2 ...'
+    - empty sequence: skipped (vLLM uses nargs="+" which requires at least one value)
+    - mapping: JSON serialized (including OmegaConf ``DictConfig`` values)
     - other: string converted
 
     Args:
@@ -300,7 +307,7 @@ def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
         if isinstance(v, bool):
             if v:
                 cli_args.append(f"--{k}")
-        elif isinstance(v, list):
+        elif isinstance(v, Sequence) and not isinstance(v, (str, bytes)):
             if not v:
                 # Skip empty lists - vLLM uses nargs="+" which requires at least one value
                 continue
@@ -310,9 +317,22 @@ def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
             cli_args.extend([str(item) for item in v])
         else:
             cli_args.append(f"--{k}")
-            # Use json.dumps for dict to ensure valid JSON format
-            cli_args.append(json.dumps(v) if isinstance(v, dict) else str(v))
+            # OmegaConf DictConfig implements Mapping but is not a dict. Convert
+            # nested mappings/sequences recursively before JSON serialization;
+            # str(DictConfig) uses single quotes and vLLM rejects it as JSON.
+            if isinstance(v, Mapping):
+                cli_args.append(json.dumps(_mapping_to_plain_container(v)))
+            else:
+                cli_args.append(str(v))
     return cli_args
+
+
+def _mapping_to_plain_container(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _mapping_to_plain_container(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_mapping_to_plain_container(item) for item in value]
+    return value
 
 
 def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional[int], result_dict: dict[str, list]):
