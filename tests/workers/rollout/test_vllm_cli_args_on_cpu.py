@@ -15,6 +15,7 @@
 import json
 
 import pytest
+from omegaconf import OmegaConf
 
 from verl.workers.rollout.vllm_rollout.utils import build_cli_args_from_config
 
@@ -83,6 +84,19 @@ class TestBuildCliArgsFromConfig:
         assert result[0] == "--extra-config"
         # JSON output may have different key ordering, so parse and compare
         assert json.loads(result[1]) == {"key": "value", "nested": True}
+
+    def test_dictconfig_hf_overrides_are_valid_json(self):
+        """Nested Hydra engine kwargs must remain valid vLLM JSON args."""
+        config = {
+            "hf_overrides": OmegaConf.create(
+                {"head_dtype": "float32"},
+            )
+        }
+
+        result = build_cli_args_from_config(config)
+
+        assert result[0] == "--hf_overrides"
+        assert json.loads(result[1]) == {"head_dtype": "float32"}
 
     def test_mixed_config(self):
         """Test a realistic mixed configuration."""

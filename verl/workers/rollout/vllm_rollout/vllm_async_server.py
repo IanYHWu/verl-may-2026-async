@@ -39,6 +39,9 @@ from verl.utils.device import get_resource_name, get_visible_devices_keyword, is
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
+from verl.utils.vllm.generation_head_dtype import (
+    apply_vllm_generation_head_dtype_patch,
+)
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
@@ -192,6 +195,11 @@ class vLLMHttpServer:
         )
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
+        # vLLM < 0.26 ignores generation head_dtype overrides. Install the
+        # upstream backport before parsing hf_overrides / constructing the
+        # engine config. Worker subprocesses apply it independently in the
+        # worker extension, since they may be spawned rather than forked.
+        apply_vllm_generation_head_dtype_patch()
         if self.node_rank != 0:
             assert master_address and master_port and dp_rpc_port, (
                 "non-master node should provide master_address, master_port and dp_rpc_port"
