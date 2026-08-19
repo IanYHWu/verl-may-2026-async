@@ -91,46 +91,70 @@ class TestCriticWorkerConfig(unittest.TestCase):
 
         self.assertEqual(engine.infer_micro_batch_size_per_gpu, 5)
 
+    def test_deprecated_global_micro_batch_size_is_rejected_with_migration_hint(self):
+        for strategy in ("fsdp", "fsdp2", "megatron"):
+            with self.subTest(strategy=strategy):
+                critic_config = SimpleNamespace(
+                    engine=SimpleNamespace(strategy=strategy),
+                    model=object(),
+                    optim=object(),
+                    checkpoint=object(),
+                    use_dynamic_bsz=False,
+                    ppo_micro_batch_size=16,
+                    ppo_micro_batch_size_per_gpu=None,
+                )
+
+                with self.assertRaisesRegex(ValueError, "ppo_micro_batch_size_per_gpu explicitly"):
+                    critic_utils.prepare_critic_worker_config_kwargs(critic_config)
+
+    def test_deprecated_global_forward_batch_size_is_rejected_with_migration_hint(self):
+        critic_config = SimpleNamespace(
+            engine=SimpleNamespace(strategy="fsdp2"),
+            model=object(),
+            optim=object(),
+            checkpoint=object(),
+            use_dynamic_bsz=False,
+            ppo_micro_batch_size=None,
+            ppo_micro_batch_size_per_gpu=2,
+            ppo_infer_micro_batch_size_per_gpu=None,
+            forward_micro_batch_size=16,
+            forward_micro_batch_size_per_gpu=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "forward_micro_batch_size_per_gpu explicitly"):
+            critic_utils.prepare_critic_worker_config_kwargs(critic_config)
+
 
 class TestFullyAsyncBatchDivisor(unittest.TestCase):
-    def test_lcm_covers_actor_and_critic_requirements(self):
-        divisor = batch_utils.get_train_batch_divisor(
-            actor_dp_size=6,
-            actor_mini_batch_rows=12,
-            critic_dp_size=4,
-            critic_mini_batch_rows=20,
+    def test_actor_and_critic_divisors_are_independent(self):
+        actor_divisor = batch_utils.get_role_batch_divisor(
+            role="actor",
+            dp_size=6,
+            mini_batch_rows=12,
         )
-        self.assertEqual(divisor, 60)
-
-    def test_actor_full_batch_still_honors_critic_minibatch(self):
-        divisor = batch_utils.get_train_batch_divisor(
-            actor_dp_size=8,
-            actor_mini_batch_rows=None,
-            critic_dp_size=4,
-            critic_mini_batch_rows=12,
+        critic_divisor = batch_utils.get_role_batch_divisor(
+            role="critic",
+            dp_size=4,
+            mini_batch_rows=20,
         )
-        self.assertEqual(divisor, 24)
+        self.assertEqual(actor_divisor, 12)
+        self.assertEqual(critic_divisor, 20)
 
-    def test_critic_requirements_must_be_provided_together(self):
-        with self.assertRaisesRegex(ValueError, "provided together"):
-            batch_utils.get_train_batch_divisor(
-                actor_dp_size=8,
-                actor_mini_batch_rows=16,
-                critic_dp_size=8,
-            )
+    def test_actor_full_batch_only_requires_actor_dp_divisibility(self):
+        divisor = batch_utils.get_role_batch_divisor(
+            role="actor",
+            dp_size=8,
+            mini_batch_rows=None,
+        )
+        self.assertEqual(divisor, 8)
 
     def test_actor_minibatch_must_be_divisible_by_actor_dp(self):
         with self.assertRaisesRegex(ValueError, "actor mini-batch rows"):
-            batch_utils.get_train_batch_divisor(actor_dp_size=4, actor_mini_batch_rows=6)
+            batch_utils.get_role_batch_divisor(role="actor", dp_size=4, mini_batch_rows=6)
 
     def test_critic_minibatch_must_be_divisible_by_critic_dp(self):
         with self.assertRaisesRegex(ValueError, "critic mini-batch rows"):
-            batch_utils.get_train_batch_divisor(
-                actor_dp_size=4,
-                actor_mini_batch_rows=8,
-                critic_dp_size=4,
-                critic_mini_batch_rows=6,
-            )
+            batch_utils.get_role_batch_divisor(role="critic", dp_size=4, mini_batch_rows=6)
 
     def test_fully_async_train_steps_are_available_before_worker_init(self):
         total_train_steps = batch_utils.get_fully_async_train_steps(
@@ -144,6 +168,21 @@ class TestFullyAsyncBatchDivisor(unittest.TestCase):
         )
         self.assertEqual(total_train_steps, 2)
         self.assertEqual(total_optimizer_steps, 8)
+
+    def test_partial_final_optimizer_batch_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "partial final optimizer batch"):
+            batch_utils.get_fully_async_optimizer_steps(
+                total_rollout_steps=130,
+                required_samples=16,
+            )
+
+    def test_partial_final_parameter_sync_cycle_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "complete final parameter-sync cycle"):
+            batch_utils.get_fully_async_train_steps(
+                total_rollout_steps=96,
+                required_samples=16,
+                trigger_parameter_sync_step=4,
+            )
 
 
 try:
@@ -258,7 +297,82 @@ class TestFullyAsyncCriticIntegration(unittest.TestCase):
         trainer._init_train_batch_divisor()
 
         self.assertEqual(queries, [(actor_wg, "actor"), (critic_wg, "train")])
-        self.assertEqual(trainer.train_batch_divisor, 48)
+        self.assertEqual(trainer.actor_batch_divisor, 16)
+        self.assertEqual(trainer.critic_batch_divisor, 12)
+
+    def test_role_specific_padding_never_creates_a_fully_masked_minibatch(self):
+        import torch
+
+        from verl import DataProto
+        from verl.experimental.fully_async_policy import fully_async_trainer
+
+        raw_trainer_cls = fully_async_trainer.FullyAsyncTrainer.__ray_actor_class__
+        trainer = object.__new__(raw_trainer_cls)
+        batch = DataProto.from_dict(
+            tensors={
+                "attention_mask": torch.ones(9, 4, dtype=torch.long),
+                "response_mask": torch.ones(9, 2, dtype=torch.long),
+            }
+        )
+        batch.batch[fully_async_trainer._VALID_ROLLOUT_ROW] = torch.ones(9, dtype=torch.bool)
+
+        actor_batch, actor_pad = trainer._pad_batch_for_role(batch, divisor=16)
+        critic_batch, _ = trainer._select_real_rollout_rows(actor_batch)
+        critic_batch, critic_pad = trainer._pad_batch_for_role(critic_batch, divisor=4)
+
+        self.assertEqual(actor_pad, 7)
+        self.assertEqual(critic_pad, 3)
+        actor_minibatches = list(actor_batch.make_iterator(16, 1, dataloader_kwargs={"shuffle": False}))
+        critic_minibatches = list(critic_batch.make_iterator(4, 1, dataloader_kwargs={"shuffle": False}))
+        self.assertTrue(all(mb.batch["response_mask"].sum() > 0 for mb in actor_minibatches))
+        self.assertTrue(all(mb.batch["response_mask"].sum() > 0 for mb in critic_minibatches))
+
+    def test_critic_uses_real_rows_and_scatters_values_back_to_actor_order(self):
+        import torch
+
+        from verl import DataProto
+        from verl.experimental.fully_async_policy import fully_async_trainer
+
+        raw_trainer_cls = fully_async_trainer.FullyAsyncTrainer.__ray_actor_class__
+        trainer = object.__new__(raw_trainer_cls)
+        trainer.use_critic = True
+        trainer.critic_batch_divisor = 4
+        trainer.metrics = {}
+
+        batch = DataProto.from_dict(
+            tensors={
+                "attention_mask": torch.ones(9, 4, dtype=torch.long),
+                "response_mask": torch.ones(9, 2, dtype=torch.long),
+            }
+        )
+        batch.batch[fully_async_trainer._VALID_ROLLOUT_ROW] = torch.ones(9, dtype=torch.bool)
+        actor_batch, _ = trainer._pad_batch_for_role(batch, divisor=16)
+        critic_calls = []
+
+        def compute_critic(_self, critic_batch):
+            critic_calls.append(critic_batch)
+            critic_batch.batch["values"] = torch.arange(len(critic_batch) * 2).reshape(len(critic_batch), 2)
+            return critic_batch
+
+        updated_batches = []
+
+        def update_critic(_self, critic_batch):
+            updated_batches.append(critic_batch)
+            return critic_batch
+
+        with (
+            patch.object(fully_async_trainer.SeparateRayPPOTrainer, "_fit_compute_critic", new=compute_critic),
+            patch.object(fully_async_trainer.SeparateRayPPOTrainer, "_fit_update_critic", new=update_critic),
+        ):
+            result = trainer._fit_compute_critic(actor_batch)
+            trainer._fit_update_critic(result)
+
+        self.assertEqual(len(critic_calls[0]), 12)
+        self.assertEqual(len(updated_batches[0]), 12)
+        self.assertNotIn(fully_async_trainer._VALID_ROLLOUT_ROW, critic_calls[0].batch)
+        self.assertNotIn(fully_async_trainer._VALID_ROLLOUT_ROW, updated_batches[0].batch)
+        self.assertEqual(result.batch["values"][:9].sum().item(), sum(range(18)))
+        self.assertEqual(result.batch["values"][9:].sum().item(), 0)
 
     def test_worker_initialization_injects_total_steps_before_models_start(self):
         from verl.experimental.fully_async_policy import fully_async_main

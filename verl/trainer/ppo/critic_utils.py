@@ -22,6 +22,29 @@ def prepare_critic_worker_config_kwargs(critic_config) -> dict:
     ensures colocated PPO and resource-separated/fully-async PPO support the same
     value-model backends and configuration schema.
     """
+    if not critic_config.use_dynamic_bsz:
+        legacy_micro_batch_size = getattr(critic_config, "ppo_micro_batch_size", None)
+        if legacy_micro_batch_size is not None:
+            raise ValueError(
+                "The unified critic TrainingWorker cannot infer a per-GPU micro-batch size from the deprecated "
+                f"critic.ppo_micro_batch_size={legacy_micro_batch_size}. Set "
+                "critic.ppo_micro_batch_size_per_gpu explicitly."
+            )
+        if critic_config.ppo_micro_batch_size_per_gpu is None:
+            raise ValueError("critic.ppo_micro_batch_size_per_gpu must be set when critic.use_dynamic_bsz is false")
+        legacy_forward_batch_size = getattr(critic_config, "forward_micro_batch_size", None)
+        forward_batch_size_per_gpu = getattr(critic_config, "forward_micro_batch_size_per_gpu", None)
+        if (
+            critic_config.ppo_infer_micro_batch_size_per_gpu is None
+            and forward_batch_size_per_gpu is None
+            and legacy_forward_batch_size is not None
+        ):
+            raise ValueError(
+                "The unified critic TrainingWorker cannot infer a per-GPU inference batch size from the deprecated "
+                f"critic.forward_micro_batch_size={legacy_forward_batch_size}. Set "
+                "critic.ppo_infer_micro_batch_size_per_gpu or critic.forward_micro_batch_size_per_gpu explicitly."
+            )
+
     engine_config = critic_config.engine
     engine_config.use_dynamic_bsz = critic_config.use_dynamic_bsz
     engine_config.infer_max_token_len_per_gpu = critic_config.ppo_infer_max_token_len_per_gpu

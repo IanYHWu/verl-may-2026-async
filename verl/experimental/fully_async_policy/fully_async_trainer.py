@@ -26,7 +26,7 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
-from verl.experimental.fully_async_policy.batch_utils import get_train_batch_divisor
+from verl.experimental.fully_async_policy.batch_utils import get_role_batch_divisor
 from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
     ValidateMetrics,
@@ -45,6 +45,8 @@ from verl.utils.tracking import Tracking, ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerManager
 
 logger = logging.getLogger(__name__)
+
+_VALID_ROLLOUT_ROW = "fully_async_valid_rollout_row"
 
 
 class TrainingStopException(Exception):
@@ -318,7 +320,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
 
     def _init_train_batch_divisor(self):
-        """Resolve DP sizes and validate optimizer mini-batches before training starts."""
+        """Resolve DP sizes and validate each role's mini-batch before training starts."""
         n = self.config.actor_rollout_ref.rollout.n
         actor_config = self.config.actor_rollout_ref.actor
         train_minibatch_rows = actor_config.get("train_minibatch_rows", None)
@@ -330,18 +332,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             )
 
         actor_dp_size = self._get_dp_size(self.actor_wg, "actor")
-        critic_dp_size = None
-        critic_mini_rows = None
+        self.actor_batch_divisor = get_role_batch_divisor(
+            role="actor",
+            dp_size=actor_dp_size,
+            mini_batch_rows=actor_mini_rows,
+        )
+
+        self.critic_batch_divisor = None
         if self.use_critic:
             critic_dp_size = self._get_dp_size(self.critic_wg, "train")
             critic_mini_rows = self.config.critic.ppo_mini_batch_size * n
-
-        self.train_batch_divisor = get_train_batch_divisor(
-            actor_dp_size=actor_dp_size,
-            actor_mini_batch_rows=actor_mini_rows,
-            critic_dp_size=critic_dp_size,
-            critic_mini_batch_rows=critic_mini_rows,
-        )
+            self.critic_batch_divisor = get_role_batch_divisor(
+                role="critic",
+                dp_size=critic_dp_size,
+                mini_batch_rows=critic_mini_rows,
+            )
 
     async def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -502,6 +507,125 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_collect_metrics(batch)
         self._fit_postprocess_step()
 
+    @staticmethod
+    def _pad_batch_for_role(batch: DataProto, divisor: int) -> tuple[DataProto, int]:
+        """Pad one role's batch without creating a fully masked mini-batch."""
+        import torch
+
+        from verl.protocol import pad_dataproto_to_divisor
+
+        if len(batch) == 0:
+            raise ValueError("cannot pad an empty fully async training batch")
+
+        orig_size = len(batch)
+        if orig_size % divisor != 0:
+            # DataProto.concat compares meta_info values directly and can fail on
+            # array-valued rollout metadata. Preserve batch metadata outside the
+            # concat and recompute its row-shaped token counts afterwards.
+            saved_meta = batch.meta_info
+            batch.meta_info = {}
+            batch, pad_size = pad_dataproto_to_divisor(batch, divisor)
+            batch.meta_info = saved_meta
+            if "response_mask" in batch.batch:
+                batch.batch["response_mask"][orig_size:] = 0
+            for key in (
+                _VALID_ROLLOUT_ROW,
+                "rm_scores",
+                "token_level_rewards",
+                "token_level_scores",
+                "advantages",
+            ):
+                if key in batch.batch:
+                    batch.batch[key][orig_size:] = 0
+        else:
+            pad_size = 0
+
+        if "attention_mask" in batch.batch:
+            batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+        return batch, pad_size
+
+    @staticmethod
+    def _select_real_rollout_rows(batch: DataProto) -> tuple[DataProto, Any]:
+        """Select unpadded rollout rows while retaining their balanced order."""
+        if _VALID_ROLLOUT_ROW not in batch.batch:
+            raise RuntimeError("fully async training batch is missing its rollout validity marker")
+        valid_mask = batch.batch[_VALID_ROLLOUT_ROW].bool()
+        if not valid_mask.any():
+            raise RuntimeError("fully async training batch has no valid rollout rows")
+        real_batch = batch[valid_mask]
+        real_batch.batch.pop(_VALID_ROLLOUT_ROW)
+        # select_idxs shares meta_info with the source DataProto. Critic-specific
+        # padding must not overwrite the actor batch's row-shaped metadata.
+        real_batch.meta_info = dict(batch.meta_info)
+        return real_batch, valid_mask
+
+    def _fit_compute_reward(self, batch: DataProto) -> DataProto:
+        marker = batch.batch.pop(_VALID_ROLLOUT_ROW) if _VALID_ROLLOUT_ROW in batch.batch else None
+        try:
+            return super()._fit_compute_reward(batch)
+        finally:
+            if marker is not None:
+                batch.batch[_VALID_ROLLOUT_ROW] = marker
+
+    def _fit_compute_log_prob(self, batch: DataProto) -> DataProto:
+        marker = batch.batch.pop(_VALID_ROLLOUT_ROW) if _VALID_ROLLOUT_ROW in batch.batch else None
+        try:
+            return super()._fit_compute_log_prob(batch)
+        finally:
+            if marker is not None:
+                batch.batch[_VALID_ROLLOUT_ROW] = marker
+
+    def _fit_compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+        marker = batch.batch.pop(_VALID_ROLLOUT_ROW) if _VALID_ROLLOUT_ROW in batch.batch else None
+        try:
+            return super()._fit_compute_ref_log_prob(batch)
+        finally:
+            if marker is not None:
+                batch.batch[_VALID_ROLLOUT_ROW] = marker
+
+    def _fit_compute_critic(self, batch: DataProto) -> DataProto:
+        """Run critic inference on real rows with critic-specific temporary padding."""
+        if not self.use_critic:
+            return batch
+
+        import torch
+
+        real_batch, valid_mask = self._select_real_rollout_rows(batch)
+        real_size = len(real_batch)
+        critic_batch, pad_size = self._pad_batch_for_role(real_batch, self.critic_batch_divisor)
+        if pad_size:
+            self.metrics["fully_async/critic_batch_pad_rows"] = float(pad_size)
+
+        critic_batch = super()._fit_compute_critic(critic_batch)
+        real_values = critic_batch.batch["values"][:real_size]
+        values = torch.zeros(
+            (len(batch), *real_values.shape[1:]),
+            dtype=real_values.dtype,
+            device=real_values.device,
+        )
+        values[valid_mask.to(device=real_values.device)] = real_values
+        return batch.union(DataProto.from_dict(tensors={"values": values}))
+
+    def _fit_update_critic(self, batch: DataProto) -> DataProto:
+        """Update the critic without actor-only pad rows or a full masked mini-batch."""
+        if not self.use_critic:
+            return batch
+
+        real_batch, _ = self._select_real_rollout_rows(batch)
+        critic_batch, pad_size = self._pad_batch_for_role(real_batch, self.critic_batch_divisor)
+        if pad_size:
+            self.metrics["fully_async/critic_batch_pad_rows"] = float(pad_size)
+        super()._fit_update_critic(critic_batch)
+        return batch
+
+    def _fit_update_actor(self, batch: DataProto) -> DataProto:
+        marker = batch.batch.pop(_VALID_ROLLOUT_ROW) if _VALID_ROLLOUT_ROW in batch.batch else None
+        try:
+            return super()._fit_update_actor(batch)
+        finally:
+            if marker is not None:
+                batch.batch[_VALID_ROLLOUT_ROW] = marker
+
     async def _fit_generate(self, batch: DataProto = None) -> DataProto | None:
         metrics = self.metrics
         timing_raw = self.timing_raw
@@ -512,40 +636,24 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self._collect_metrics_from_samples(batch, metrics)
             # The collected batch may not be a multiple of the actor's sequence-level
             # mini-batch (ppo_mini_batch_size * n) when the rollout produces a variable
-            # number of rows per sample (e.g. per-step / multi-row agent recipes). Pad
-            # to a clean multiple and mask the pad rows out of the gradient so the
-            # mini-batch split is valid. No-op when already divisible.
+            # number of rows per sample. Actor and critic padding are deliberately
+            # separate: a cross-role LCM can create a whole all-masked optimizer
+            # mini-batch for the role with the smaller mini-batch size.
             import torch as _torch
 
-            from verl.protocol import pad_dataproto_to_divisor
-
-            divisor = self.train_batch_divisor
-            if len(batch) % divisor != 0:
-                orig_size = len(batch)
-                # pad_dataproto_to_divisor concats slices, and DataProto.concat asserts
-                # meta_info[k] == v per key — which raises on array-valued meta_info
-                # (e.g. trajectory_param_versions). meta_info is batch-level and already
-                # consumed by _collect_metrics_from_samples above, so clear it across the
-                # pad, then restore it and recompute the per-row global_token_num.
-                saved_meta = batch.meta_info
-                batch.meta_info = {}
-                batch, pad_size = pad_dataproto_to_divisor(batch, divisor)
-                batch.meta_info = saved_meta
-                if "response_mask" in batch.batch:
-                    batch.batch["response_mask"][orig_size:] = 0
-                for _k in ("rm_scores", "token_level_rewards", "token_level_scores", "advantages"):
-                    if _k in batch.batch:
-                        batch.batch[_k][orig_size:] = 0
-                if "attention_mask" in batch.batch:
-                    batch.meta_info["global_token_num"] = _torch.sum(
-                        batch.batch["attention_mask"], dim=-1).tolist()
-                metrics["fully_async/batch_pad_rows"] = float(pad_size)
+            batch.batch[_VALID_ROLLOUT_ROW] = _torch.ones(
+                len(batch),
+                dtype=_torch.bool,
+                device=batch.batch["attention_mask"].device,
+            )
+            batch, pad_size = self._pad_batch_for_role(batch, self.actor_batch_divisor)
+            if pad_size:
+                metrics["fully_async/actor_batch_pad_rows"] = float(pad_size)
             # Balance sequence lengths across DP ranks AFTER the pad above (which made len a
-            # multiple of every enabled worker and mini-batch requirement). Doing it here — not in
-            # _get_samples_from_queue, pre-pad — lets _balance_batch's equal_size=True seqlen
-            # partition see a DP-divisible row count, so it no longer asserts `len % dp_size != 0`
-            # on a variable/odd v3 per-step row count. Pad rows are already masked, so the
-            # reorder is loss-neutral.
+            # multiple of the actor's DP/mini-batch requirement). Doing it here — not in
+            # _get_samples_from_queue, pre-pad — lets _balance_batch's equal_size=True partition
+            # see a DP-divisible row count. The validity marker is reordered with every other row
+            # field, so critic selection still follows the actor's balanced ordering.
             if self.config.trainer.balance_batch:
                 self._balance_batch(batch, metrics=metrics)
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
@@ -917,5 +1025,5 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                     continue  # bookkeeping list, not a metric
                 if key.startswith("fully_async") or key.startswith("timing_s"):
                     metrics[key] = value
-                    if key.startswith("fully_async/") and key[len("fully_async/"):] in mgr_keys:
-                        metrics[key[len("fully_async/"):]] = value
+                    if key.startswith("fully_async/") and key[len("fully_async/") :] in mgr_keys:
+                        metrics[key[len("fully_async/") :]] = value

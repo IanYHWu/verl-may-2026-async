@@ -14,49 +14,28 @@
 
 """Dependency-light batch sizing helpers for fully asynchronous PPO."""
 
-import math
 
+def get_role_batch_divisor(*, role: str, dp_size: int, mini_batch_rows: int | None) -> int:
+    """Return one train role's required row-count multiple.
 
-def get_train_batch_divisor(
-    *,
-    actor_dp_size: int,
-    actor_mini_batch_rows: int | None,
-    critic_dp_size: int | None = None,
-    critic_mini_batch_rows: int | None = None,
-) -> int:
-    """Return the row-count multiple required by every enabled train worker.
+    Actor and critic batches must be padded independently. Taking an LCM across
+    roles can add an entire all-masked optimizer mini-batch to the role with the
+    smaller mini-batch, which still advances AdamW and its LR scheduler.
 
-    ``actor_mini_batch_rows=None`` represents actor full-batch mode: only the
-    actor data-parallel divisibility requirement applies. Critic training always
-    retains its configured PPO mini-batch size.
+    ``mini_batch_rows=None`` represents full-batch mode, where data-parallel
+    divisibility is the only constraint.
     """
-    divisors = [actor_dp_size]
-    if actor_dp_size <= 0:
-        raise ValueError(f"actor data-parallel size must be positive, got {actor_dp_size}")
-    if actor_mini_batch_rows is not None:
-        if actor_mini_batch_rows % actor_dp_size != 0:
-            raise ValueError(
-                f"actor mini-batch rows ({actor_mini_batch_rows}) must be divisible by "
-                f"actor data-parallel size ({actor_dp_size})"
-            )
-        divisors.append(actor_mini_batch_rows)
-
-    if (critic_dp_size is None) != (critic_mini_batch_rows is None):
-        raise ValueError("critic data-parallel size and mini-batch rows must be provided together")
-    if critic_dp_size is not None:
-        assert critic_mini_batch_rows is not None
-        if critic_dp_size <= 0:
-            raise ValueError(f"critic data-parallel size must be positive, got {critic_dp_size}")
-        if critic_mini_batch_rows % critic_dp_size != 0:
-            raise ValueError(
-                f"critic mini-batch rows ({critic_mini_batch_rows}) must be divisible by "
-                f"critic data-parallel size ({critic_dp_size})"
-            )
-        divisors.extend((critic_dp_size, critic_mini_batch_rows))
-
-    if any(divisor <= 0 for divisor in divisors):
-        raise ValueError(f"batch divisors must be positive, got {divisors}")
-    return math.lcm(*divisors)
+    if dp_size <= 0:
+        raise ValueError(f"{role} data-parallel size must be positive, got {dp_size}")
+    if mini_batch_rows is None:
+        return dp_size
+    if mini_batch_rows <= 0:
+        raise ValueError(f"{role} mini-batch rows must be positive, got {mini_batch_rows}")
+    if mini_batch_rows % dp_size != 0:
+        raise ValueError(
+            f"{role} mini-batch rows ({mini_batch_rows}) must be divisible by {role} data-parallel size ({dp_size})"
+        )
+    return mini_batch_rows
 
 
 def get_fully_async_train_steps(
@@ -66,14 +45,21 @@ def get_fully_async_train_steps(
     trigger_parameter_sync_step: int,
 ) -> int:
     """Compute parameter versions before trainer model initialization."""
-    divisors = (required_samples, trigger_parameter_sync_step)
-    if total_rollout_steps < 0 or any(divisor <= 0 for divisor in divisors):
+    if trigger_parameter_sync_step <= 0:
         raise ValueError(
-            "total rollout steps must be non-negative and async training divisors must be positive, "
-            f"got total_rollout_steps={total_rollout_steps}, required_samples={required_samples}, "
-            f"trigger_parameter_sync_step={trigger_parameter_sync_step}"
+            f"trigger_parameter_sync_step must be positive, trigger_parameter_sync_step={trigger_parameter_sync_step}"
         )
-    return total_rollout_steps // (required_samples * trigger_parameter_sync_step)
+    optimizer_steps = get_fully_async_optimizer_steps(
+        total_rollout_steps=total_rollout_steps,
+        required_samples=required_samples,
+    )
+    if optimizer_steps % trigger_parameter_sync_step != 0:
+        raise ValueError(
+            "fully async training requires a complete final parameter-sync cycle: "
+            f"optimizer_steps ({optimizer_steps}) must be divisible by trigger_parameter_sync_step "
+            f"({trigger_parameter_sync_step})"
+        )
+    return optimizer_steps // trigger_parameter_sync_step
 
 
 def get_fully_async_optimizer_steps(*, total_rollout_steps: int, required_samples: int) -> int:
@@ -82,5 +68,11 @@ def get_fully_async_optimizer_steps(*, total_rollout_steps: int, required_sample
         raise ValueError(
             "total rollout steps must be non-negative and required samples must be positive, "
             f"got total_rollout_steps={total_rollout_steps}, required_samples={required_samples}"
+        )
+    if total_rollout_steps % required_samples != 0:
+        raise ValueError(
+            "fully async training cannot consume a partial final optimizer batch: "
+            f"total_rollout_steps ({total_rollout_steps}) must be divisible by required_samples "
+            f"({required_samples})"
         )
     return total_rollout_steps // required_samples
