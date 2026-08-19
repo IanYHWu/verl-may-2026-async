@@ -24,6 +24,10 @@ import ray
 import torch
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
+from verl.experimental.fully_async_policy.batch_utils import (
+    get_fully_async_optimizer_steps,
+    get_fully_async_train_steps,
+)
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
     ValidateMetrics,
@@ -164,7 +168,21 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         if self.config.rollout.total_rollout_steps is not None:
             self.total_rollout_steps = min(self.config.rollout.total_rollout_steps, self.total_rollout_steps)
         print(f"[FullyAsyncRollouter] Total rollout steps: {self.total_rollout_steps}")
-        self.total_train_steps = None
+
+        # Compute the trainer's optimizer horizon before either actor or critic
+        # initializes its optimizer/scheduler. Worker GPU allocation still happens
+        # later, with trainer workers allocated before rollout workers.
+        self.require_batches = config.async_training.require_batches
+        self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
+        self.total_train_steps = get_fully_async_train_steps(
+            total_rollout_steps=self.total_rollout_steps,
+            required_samples=self.required_samples,
+            trigger_parameter_sync_step=config.async_training.trigger_parameter_sync_step,
+        )
+        self.total_optimizer_steps = get_fully_async_optimizer_steps(
+            total_rollout_steps=self.total_rollout_steps,
+            required_samples=self.required_samples,
+        )
 
         # Rollouter parameter configuration
         self.message_queue_client = None
@@ -176,9 +194,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # Config
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
-        # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
-        self.require_batches = config.async_training.require_batches
-        self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
         self.max_required_samples = None
         self.max_concurrent_samples = None
         # queue size
@@ -240,10 +255,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 * (self.staleness_threshold + 1)
                 * self.config.async_training.trigger_parameter_sync_step
             )
-            self.total_train_steps = int(
-                self.total_rollout_steps
-                / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
-            )
 
             concurrency_multiplier = self.config.async_training.get("concurrency_multiplier", 16)
             self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * concurrency_multiplier
@@ -268,6 +279,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     def get_total_train_steps(self):
         return self.total_train_steps
+
+    def get_total_optimizer_steps(self):
+        return self.total_optimizer_steps
 
     async def reset_staleness(self):
         """
@@ -617,7 +631,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 self._inflight_inputs[sample_id] = {"epoch": rec["epoch"], "full_batch": rec["full_batch"]}
             await self.pending_queue.put(rollout_sample)
         if self._resumed_inflight:
-            print(f"[FullyAsyncRollouter][Feed] re-dispatched {len(self._resumed_inflight)} in-flight samples from resume")
+            print(
+                f"[FullyAsyncRollouter][Feed] re-dispatched {len(self._resumed_inflight)} "
+                "in-flight samples from resume"
+            )
         self._resumed_inflight = []
 
         continuous_iterator = self._create_continuous_iterator()

@@ -211,16 +211,18 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Setup checkpoint manager after rollouter is set
         self._setup_checkpoint_manager(rollouter)
 
-    def set_total_train_steps(self, total_training_steps):
+    def set_total_train_steps(self, total_training_steps, total_optimizer_steps=None):
         self.total_train_steps = total_training_steps
+        if total_optimizer_steps is None:
+            total_optimizer_steps = total_training_steps
 
         try:
             OmegaConf.set_struct(self.config, True)
             with open_dict(self.config):
                 if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
-                    self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
+                    self.config.actor_rollout_ref.actor.optim.total_training_steps = total_optimizer_steps
                 if OmegaConf.select(self.config, "critic.optim"):
-                    self.config.critic.optim.total_training_steps = total_training_steps
+                    self.config.critic.optim.total_training_steps = total_optimizer_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
@@ -315,6 +317,32 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.actor_wg.init_model()
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
 
+    def _init_train_batch_divisor(self):
+        """Resolve DP sizes and validate optimizer mini-batches before training starts."""
+        n = self.config.actor_rollout_ref.rollout.n
+        actor_config = self.config.actor_rollout_ref.actor
+        train_minibatch_rows = actor_config.get("train_minibatch_rows", None)
+        if train_minibatch_rows == 0:
+            actor_mini_rows = None
+        else:
+            actor_mini_rows = (
+                int(train_minibatch_rows) if train_minibatch_rows else actor_config.ppo_mini_batch_size * n
+            )
+
+        actor_dp_size = self._get_dp_size(self.actor_wg, "actor")
+        critic_dp_size = None
+        critic_mini_rows = None
+        if self.use_critic:
+            critic_dp_size = self._get_dp_size(self.critic_wg, "train")
+            critic_mini_rows = self.config.critic.ppo_mini_batch_size * n
+
+        self.train_batch_divisor = get_train_batch_divisor(
+            actor_dp_size=actor_dp_size,
+            actor_mini_batch_rows=actor_mini_rows,
+            critic_dp_size=critic_dp_size,
+            critic_mini_batch_rows=critic_mini_rows,
+        )
+
     async def init_workers(self):
         """Initialize distributed training workers using Ray backend.
         Creates:
@@ -325,6 +353,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._create_worker_classes()
         self._init_worker_groups()
         self._init_models()
+        self._init_train_batch_divisor()
         self._init_reward_loop()
         await self._init_async_rollout_manager()
 
@@ -490,34 +519,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
             from verl.protocol import pad_dataproto_to_divisor
 
-            n = self.config.actor_rollout_ref.rollout.n
-            ppo_mini = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-            # Default optimizer mini-batch is ppo_mini * n rows; an explicit
-            # train_minibatch_rows overrides it. Must match the split size that
-            # _update_actor (ray_trainer) passes to make_iterator.
-            train_minibatch_rows = self.config.actor_rollout_ref.actor.get("train_minibatch_rows", None)
-            if train_minibatch_rows == 0:
-                # Full-batch mode: exactly ONE optimizer step over the whole batch, so pad ONLY
-                # to worker divisibility instead of up to a fixed actor row count.
-                # _update_actor sets mini_batch_size = len(batch), so make_iterator's
-                # `batch % mini_batch_size == 0` holds trivially. Minimizes masked-pad waste while
-                # keeping opt-steps-per-train-step = 1 regardless of the variable per-step row count.
-                actor_mini_rows = None
-            else:
-                actor_mini_rows = int(train_minibatch_rows) if train_minibatch_rows else ppo_mini * n
-
-            critic_world_size = None
-            critic_mini_rows = None
-            if self.use_critic:
-                critic_world_size = self.critic_wg.world_size
-                critic_mini_rows = self.config.critic.ppo_mini_batch_size * n
-
-            divisor = get_train_batch_divisor(
-                actor_world_size=self.actor_wg.world_size,
-                actor_mini_batch_rows=actor_mini_rows,
-                critic_world_size=critic_world_size,
-                critic_mini_batch_rows=critic_mini_rows,
-            )
+            divisor = self.train_batch_divisor
             if len(batch) % divisor != 0:
                 orig_size = len(batch)
                 # pad_dataproto_to_divisor concats slices, and DataProto.concat asserts

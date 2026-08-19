@@ -19,27 +19,68 @@ import math
 
 def get_train_batch_divisor(
     *,
-    actor_world_size: int,
+    actor_dp_size: int,
     actor_mini_batch_rows: int | None,
-    critic_world_size: int | None = None,
+    critic_dp_size: int | None = None,
     critic_mini_batch_rows: int | None = None,
 ) -> int:
     """Return the row-count multiple required by every enabled train worker.
 
     ``actor_mini_batch_rows=None`` represents actor full-batch mode: only the
-    actor worker-group divisibility requirement applies. Critic training always
+    actor data-parallel divisibility requirement applies. Critic training always
     retains its configured PPO mini-batch size.
     """
-    divisors = [actor_world_size]
+    divisors = [actor_dp_size]
+    if actor_dp_size <= 0:
+        raise ValueError(f"actor data-parallel size must be positive, got {actor_dp_size}")
     if actor_mini_batch_rows is not None:
+        if actor_mini_batch_rows % actor_dp_size != 0:
+            raise ValueError(
+                f"actor mini-batch rows ({actor_mini_batch_rows}) must be divisible by "
+                f"actor data-parallel size ({actor_dp_size})"
+            )
         divisors.append(actor_mini_batch_rows)
 
-    if (critic_world_size is None) != (critic_mini_batch_rows is None):
-        raise ValueError("critic world size and mini-batch rows must be provided together")
-    if critic_world_size is not None:
+    if (critic_dp_size is None) != (critic_mini_batch_rows is None):
+        raise ValueError("critic data-parallel size and mini-batch rows must be provided together")
+    if critic_dp_size is not None:
         assert critic_mini_batch_rows is not None
-        divisors.extend((critic_world_size, critic_mini_batch_rows))
+        if critic_dp_size <= 0:
+            raise ValueError(f"critic data-parallel size must be positive, got {critic_dp_size}")
+        if critic_mini_batch_rows % critic_dp_size != 0:
+            raise ValueError(
+                f"critic mini-batch rows ({critic_mini_batch_rows}) must be divisible by "
+                f"critic data-parallel size ({critic_dp_size})"
+            )
+        divisors.extend((critic_dp_size, critic_mini_batch_rows))
 
     if any(divisor <= 0 for divisor in divisors):
         raise ValueError(f"batch divisors must be positive, got {divisors}")
     return math.lcm(*divisors)
+
+
+def get_fully_async_train_steps(
+    *,
+    total_rollout_steps: int,
+    required_samples: int,
+    trigger_parameter_sync_step: int,
+) -> int:
+    """Compute parameter versions before trainer model initialization."""
+    divisors = (required_samples, trigger_parameter_sync_step)
+    if total_rollout_steps < 0 or any(divisor <= 0 for divisor in divisors):
+        raise ValueError(
+            "total rollout steps must be non-negative and async training divisors must be positive, "
+            f"got total_rollout_steps={total_rollout_steps}, required_samples={required_samples}, "
+            f"trigger_parameter_sync_step={trigger_parameter_sync_step}"
+        )
+    return total_rollout_steps // (required_samples * trigger_parameter_sync_step)
+
+
+def get_fully_async_optimizer_steps(*, total_rollout_steps: int, required_samples: int) -> int:
+    """Compute local actor/critic optimizer updates across all parameter versions."""
+    if total_rollout_steps < 0 or required_samples <= 0:
+        raise ValueError(
+            "total rollout steps must be non-negative and required samples must be positive, "
+            f"got total_rollout_steps={total_rollout_steps}, required_samples={required_samples}"
+        )
+    return total_rollout_steps // required_samples

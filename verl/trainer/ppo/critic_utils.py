@@ -23,8 +23,16 @@ def prepare_critic_worker_config_kwargs(critic_config) -> dict:
     value-model backends and configuration schema.
     """
     engine_config = critic_config.engine
+    engine_config.use_dynamic_bsz = critic_config.use_dynamic_bsz
     engine_config.infer_max_token_len_per_gpu = critic_config.ppo_infer_max_token_len_per_gpu
+    infer_micro_batch_size_per_gpu = critic_config.ppo_infer_micro_batch_size_per_gpu
+    if infer_micro_batch_size_per_gpu is None:
+        infer_micro_batch_size_per_gpu = getattr(critic_config, "forward_micro_batch_size_per_gpu", None)
+    if infer_micro_batch_size_per_gpu is None:
+        infer_micro_batch_size_per_gpu = critic_config.ppo_micro_batch_size_per_gpu
+    engine_config.infer_micro_batch_size_per_gpu = infer_micro_batch_size_per_gpu
     engine_config.max_token_len_per_gpu = critic_config.ppo_max_token_len_per_gpu
+    engine_config.micro_batch_size_per_gpu = critic_config.ppo_micro_batch_size_per_gpu
 
     return {
         "model_type": "value_model",

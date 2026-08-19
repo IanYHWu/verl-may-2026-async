@@ -21,8 +21,8 @@ if [ "$rollout_mode" = "async" ]; then
     return_raw_chat="True"
 fi
 
-# Algorithm parameters. Set ADV_ESTIMATOR=gae to exercise PPO with a critic.
-adv_estimator=${ADV_ESTIMATOR:-grpo}
+# Algorithm parameters. Override with ADV_ESTIMATOR=grpo for the critic-free path.
+adv_estimator=${ADV_ESTIMATOR:-gae}
 
 use_kl_in_reward=False
 kl_coef=0.0
@@ -63,7 +63,12 @@ trigger_parameter_sync_step=4
 partial_rollout=True
 use_trainer_do_validate=False
 
-exp_name="$(basename "${MODEL_ID,,}")-fully-async-policy-${ACTOR_STRATEGY}-minimal"
+ppo_artifact_dir=${PPO_ARTIFACT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/verl-fully-async-ppo.XXXXXX")}
+mkdir -p "${ppo_artifact_dir}"
+ppo_log_file="${ppo_artifact_dir}/train.log"
+ppo_checkpoint_dir="${ppo_artifact_dir}/checkpoints"
+
+exp_name="$(basename "${MODEL_ID,,}")-fully-async-policy-${adv_estimator}-${ACTOR_STRATEGY}-minimal"
 
 echo "Running fully_async_policy with ${ACTOR_STRATEGY} strategy"
 echo "Total GPUs: ${NUM_GPUS}, Rollout GPUs: ${n_gpus_rollout}, Training GPUs: ${n_gpus_training}"
@@ -122,7 +127,8 @@ common_params=(
     trainer.project_name='verl-test-fully-async'
     trainer.experiment_name="${exp_name}"
     trainer.val_before_train=True
-    trainer.save_freq=-1
+    trainer.save_freq=1
+    trainer.default_local_dir="${ppo_checkpoint_dir}"
     trainer.resume_mode=disable
     trainer.nnodes=1
     trainer.n_gpus_per_node=${n_gpus_training}
@@ -182,7 +188,8 @@ if [ "${ACTOR_STRATEGY}" == "fsdp2" ]; then
         actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
         actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
         actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
-        actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} $@
+        actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} "$@" \
+        2>&1 | tee "${ppo_log_file}"
 
 elif [ "${ACTOR_STRATEGY}" == "megatron" ]; then
     echo "Running fully async training with Megatron strategy..."
@@ -221,10 +228,19 @@ elif [ "${ACTOR_STRATEGY}" == "megatron" ]; then
         actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
         actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${train_pp} \
         actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp} \
-        actor_rollout_ref.ref.megatron.param_offload=${ref_offload} $@
+        actor_rollout_ref.ref.megatron.param_offload=${ref_offload} "$@" \
+        2>&1 | tee "${ppo_log_file}"
 else
     echo "Error: Unknown strategy ${ACTOR_STRATEGY}. Please use 'fsdp2' or 'megatron'"
     exit 1
+fi
+
+if [ "${adv_estimator}" = "gae" ]; then
+    grep -q "critic/vf_loss" "${ppo_log_file}"
+    if ! find "${ppo_checkpoint_dir}" -type d -name critic -print -quit | grep -q .; then
+        echo "Error: PPO run did not create a critic checkpoint under ${ppo_checkpoint_dir}"
+        exit 1
+    fi
 fi
 
 echo "Fully async policy E2E test completed successfully with ${ACTOR_STRATEGY} strategy"
