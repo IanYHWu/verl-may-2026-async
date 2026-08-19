@@ -385,21 +385,32 @@ class ValidationGenerationsLogger:
     project_name: str = None
     experiment_name: str = None
 
+    # Sample tables are diagnostics, not training state. Several backends reach the
+    # network while logging them -- wandb's Table path calls run._public_api(), which
+    # re-validates the API key over GraphQL -- and an outage there used to raise straight
+    # through the trainer's validation step and kill the run. Contain each backend
+    # separately so one failing tracker cannot take down training or block the others.
+    def _log_generations_safely(self, backend: str, log_fn, samples, step) -> None:
+        try:
+            log_fn(samples, step)
+        except Exception as e:
+            logger.warning(
+                f"Failed to log validation generations to {backend} at step {step}: "
+                f"{type(e).__name__}: {e}. Training continues; only this sample table is lost."
+            )
+
     def log(self, loggers, samples, step):
-        if "wandb" in loggers:
-            self.log_generations_to_wandb(samples, step)
-        if "swanlab" in loggers:
-            self.log_generations_to_swanlab(samples, step)
-        if "mlflow" in loggers:
-            self.log_generations_to_mlflow(samples, step)
-
-        if "clearml" in loggers:
-            self.log_generations_to_clearml(samples, step)
-        if "tensorboard" in loggers:
-            self.log_generations_to_tensorboard(samples, step)
-
-        if "vemlp_wandb" in loggers:
-            self.log_generations_to_vemlp_wandb(samples, step)
+        backends = (
+            ("wandb", self.log_generations_to_wandb),
+            ("swanlab", self.log_generations_to_swanlab),
+            ("mlflow", self.log_generations_to_mlflow),
+            ("clearml", self.log_generations_to_clearml),
+            ("tensorboard", self.log_generations_to_tensorboard),
+            ("vemlp_wandb", self.log_generations_to_vemlp_wandb),
+        )
+        for backend, log_fn in backends:
+            if backend in loggers:
+                self._log_generations_safely(backend, log_fn, samples, step)
 
     def log_generations_to_vemlp_wandb(self, samples, step):
         from volcengine_ml_platform import wandb as vemlp_wandb
