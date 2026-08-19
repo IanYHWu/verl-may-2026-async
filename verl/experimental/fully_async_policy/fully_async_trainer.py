@@ -26,6 +26,7 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
+from verl.experimental.fully_async_policy.batch_utils import get_train_batch_divisor
 from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
     ValidateMetrics,
@@ -304,9 +305,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         pass
 
     def _init_models(self):
-        if self.use_critic:
-            self.critic_wg = self.all_wg[str(Role.Critic)]
-            self.critic_wg.init_model()
+        self._init_critic_model()
 
         if self.use_reference_policy and not self.ref_in_actor:
             self.ref_policy_wg = self.all_wg[str(Role.RefPolicy)]
@@ -499,14 +498,26 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             train_minibatch_rows = self.config.actor_rollout_ref.actor.get("train_minibatch_rows", None)
             if train_minibatch_rows == 0:
                 # Full-batch mode: exactly ONE optimizer step over the whole batch, so pad ONLY
-                # to DP-divisibility (world_size ⊇ dp_size) instead of up to a fixed row count.
+                # to worker divisibility instead of up to a fixed actor row count.
                 # _update_actor sets mini_batch_size = len(batch), so make_iterator's
                 # `batch % mini_batch_size == 0` holds trivially. Minimizes masked-pad waste while
                 # keeping opt-steps-per-train-step = 1 regardless of the variable per-step row count.
-                divisor = self.actor_wg.world_size
+                actor_mini_rows = None
             else:
-                mini_rows = int(train_minibatch_rows) if train_minibatch_rows else ppo_mini * n
-                divisor = max(self.actor_wg.world_size, mini_rows)
+                actor_mini_rows = int(train_minibatch_rows) if train_minibatch_rows else ppo_mini * n
+
+            critic_world_size = None
+            critic_mini_rows = None
+            if self.use_critic:
+                critic_world_size = self.critic_wg.world_size
+                critic_mini_rows = self.config.critic.ppo_mini_batch_size * n
+
+            divisor = get_train_batch_divisor(
+                actor_world_size=self.actor_wg.world_size,
+                actor_mini_batch_rows=actor_mini_rows,
+                critic_world_size=critic_world_size,
+                critic_mini_batch_rows=critic_mini_rows,
+            )
             if len(batch) % divisor != 0:
                 orig_size = len(batch)
                 # pad_dataproto_to_divisor concats slices, and DataProto.concat asserts
@@ -528,7 +539,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                         batch.batch["attention_mask"], dim=-1).tolist()
                 metrics["fully_async/batch_pad_rows"] = float(pad_size)
             # Balance sequence lengths across DP ranks AFTER the pad above (which made len a
-            # multiple of max(world_size, mini_rows) ⊇ dp_size). Doing it here — not in
+            # multiple of every enabled worker and mini-batch requirement). Doing it here — not in
             # _get_samples_from_queue, pre-pad — lets _balance_batch's equal_size=True seqlen
             # partition see a DP-divisible row count, so it no longer asserts `len % dp_size != 0`
             # on a variable/odd v3 per-step row count. Pad rows are already masked, so the

@@ -35,6 +35,7 @@ from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.critic_utils import prepare_critic_worker_config_kwargs
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -152,24 +153,10 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             critic_cfg = omega_conf_to_dataclass(self.config.critic)
 
             # convert critic_cfg into TrainingWorkerConfig for the unified model engine worker
-            from verl.workers.config import FSDPEngineConfig
             from verl.workers.engine_workers import TrainingWorkerConfig
 
             self.orig_critic_cfg = critic_cfg
-            if self.orig_critic_cfg.strategy == "fsdp":
-                engine_config: FSDPEngineConfig = self.orig_critic_cfg.model.fsdp_config
-                engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
-                engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
-            else:
-                raise NotImplementedError(f"Unknown strategy {self.orig_critic_cfg.strategy=}")
-
-            critic_cfg = TrainingWorkerConfig(
-                model_type="value_model",
-                model_config=self.orig_critic_cfg.model_config,
-                engine_config=engine_config,
-                optimizer_config=self.orig_critic_cfg.optim,
-                checkpoint_config=self.orig_critic_cfg.checkpoint,
-            )
+            critic_cfg = TrainingWorkerConfig(**prepare_critic_worker_config_kwargs(self.orig_critic_cfg))
 
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
@@ -231,7 +218,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             all_wg.update(spawn_wg)
         self.all_wg = all_wg
 
-    def _init_models(self):
+    def _init_critic_model(self):
         if self.use_critic:
             self.critic_wg = self.all_wg[str(Role.Critic)]
             self.critic_wg.reset()
@@ -242,6 +229,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
 
             value_loss_ = partial(value_loss, config=self.orig_critic_cfg)
             self.critic_wg.set_loss_fn(value_loss_)
+
+    def _init_models(self):
+        self._init_critic_model()
 
         if self.use_reference_policy and not self.ref_in_actor:
             self.ref_policy_wg = self.all_wg[str(Role.RefPolicy)]

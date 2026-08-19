@@ -21,8 +21,8 @@ if [ "$rollout_mode" = "async" ]; then
     return_raw_chat="True"
 fi
 
-# Algorithm parameters
-adv_estimator=grpo
+# Algorithm parameters. Set ADV_ESTIMATOR=gae to exercise PPO with a critic.
+adv_estimator=${ADV_ESTIMATOR:-grpo}
 
 use_kl_in_reward=False
 kl_coef=0.0
@@ -54,7 +54,7 @@ n_gpus_training=4
 
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=16
+n_resp_per_prompt=${N_RESP_PER_PROMPT:-16}
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((128)))
 test_freq=-1
@@ -91,7 +91,9 @@ common_params=(
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high}
     actor_rollout_ref.actor.clip_ratio_c=10.0
     actor_rollout_ref.model.path="${MODEL_PATH}"
+    critic.model.path="${MODEL_PATH}"
     actor_rollout_ref.actor.optim.lr=1e-6
+    critic.optim.lr=1e-5
     actor_rollout_ref.actor.optim.lr_warmup_steps=-1
     actor_rollout_ref.actor.optim.weight_decay=0.1
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz}
@@ -168,6 +170,7 @@ if [ "${ACTOR_STRATEGY}" == "fsdp2" ]; then
         actor_rollout_ref.model.enable_gradient_checkpointing=True \
         actor_rollout_ref.actor.fsdp_config.strategy=fsdp2 \
         critic.strategy=fsdp2 \
+        critic.use_dynamic_bsz=True \
         actor_rollout_ref.actor.grad_clip=1.0 \
         actor_rollout_ref.model.use_remove_padding=True \
         actor_rollout_ref.actor.use_dynamic_bsz=True \
@@ -200,7 +203,9 @@ elif [ "${ACTOR_STRATEGY}" == "megatron" ]; then
         actor_rollout_ref.actor.strategy=megatron \
         critic.strategy=megatron \
         actor_rollout_ref.actor.optim.lr_decay_steps=10000000 \
+        critic.optim.lr_decay_steps=10000000 \
         actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+        critic.ppo_micro_batch_size_per_gpu=2 \
         actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
         actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
         actor_rollout_ref.actor.megatron.param_offload=${actor_offload} \
@@ -208,6 +213,11 @@ elif [ "${ACTOR_STRATEGY}" == "megatron" ]; then
         actor_rollout_ref.actor.megatron.grad_offload=${actor_offload} \
         actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
         actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
+        critic.megatron.pipeline_model_parallel_size=${train_pp} \
+        critic.megatron.tensor_model_parallel_size=${train_tp} \
+        critic.megatron.param_offload=${actor_offload} \
+        critic.megatron.optimizer_offload=${actor_offload} \
+        critic.megatron.grad_offload=${actor_offload} \
         actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
         actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${train_pp} \
         actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp} \
@@ -218,4 +228,3 @@ else
 fi
 
 echo "Fully async policy E2E test completed successfully with ${ACTOR_STRATEGY} strategy"
-

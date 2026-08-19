@@ -303,3 +303,17 @@ class TestCriticConfig:
             optim=FSDPOptimizerConfig(lr=0.1),
         )
         assert valid_config_no_sp.ulysses_sequence_parallel_size == 1
+
+
+def test_critic_config_accepts_fully_async_streaming_batch_size():
+    config = CriticConfig(
+        strategy="fsdp2",
+        ppo_mini_batch_size=16,
+        ppo_micro_batch_size_per_gpu=1,
+        optim=OptimizerConfig(lr=0.1),
+    )
+
+    config.validate(n_gpus=8, train_batch_size=0)
+
+    with pytest.raises(ValueError, match="train_batch_size"):
+        config.validate(n_gpus=8, train_batch_size=8)
