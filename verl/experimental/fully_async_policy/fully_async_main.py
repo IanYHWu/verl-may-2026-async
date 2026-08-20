@@ -74,21 +74,10 @@ class FullyAsyncTaskRunner:
         self.components["role_worker_mapping"] = role_worker_mapping
         self.components["ray_worker_group_cls"] = ray_worker_group_cls
 
-        from concurrent.futures import ThreadPoolExecutor
-
-        print("[ASYNC MAIN] Creating FullyAsyncRollouter and FullyAsyncTrainer in parallel...")
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            # Rollouter does not permit continuous allocation, so we allocate trainer first.
-            trainer_future = executor.submit(self._create_trainer, config)
-            trainer_future.result()
-
-            rollouter_future = executor.submit(self._create_rollouter, config)
-            rollouter_future.result()
-
-        # sync total_train_steps between rollouter and trainer
-        total_train_steps = ray.get(self.components["rollouter"].get_total_train_steps.remote())
-        print(f"total_train_steps {total_train_steps}")
-        ray.get(self.components["trainer"].set_total_train_steps.remote(total_train_steps))
+        print("[ASYNC MAIN] Creating FullyAsyncRollouter and FullyAsyncTrainer controllers...")
+        self._create_trainer(config)
+        self._create_rollouter(config)
+        self._initialize_worker_components()
 
         # max_queue_size
         max_queue_size = ray.get(self.components["rollouter"].get_max_queue_size.remote())
@@ -128,11 +117,8 @@ class FullyAsyncTaskRunner:
             device_name=config.trainer.device,
         )
 
-        ray.get(rollouter.init_workers.remote())
-        ray.get(rollouter.set_max_required_samples.remote())
-
         self.components["rollouter"] = rollouter
-        print("[ASYNC MAIN] Rollouter created and initialized successfully")
+        print("[ASYNC MAIN] Rollouter controller created successfully")
 
     def _create_trainer(self, config) -> None:
         print("[ASYNC MAIN] Starting create trainer...")
@@ -152,9 +138,25 @@ class FullyAsyncTaskRunner:
             device_name=config.trainer.device,
         )
 
-        ray.get(trainer.init_workers.remote())
         self.components["trainer"] = trainer
-        print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
+        print("[ASYNC MAIN] FullyAsyncTrainer controller created successfully")
+
+    def _initialize_worker_components(self) -> None:
+        """Inject the optimizer horizon before allocating and initializing model workers."""
+        trainer = self.components["trainer"]
+        rollouter = self.components["rollouter"]
+
+        total_train_steps = ray.get(rollouter.get_total_train_steps.remote())
+        total_optimizer_steps = ray.get(rollouter.get_total_optimizer_steps.remote())
+        print(f"total_train_steps {total_train_steps}, total_optimizer_steps {total_optimizer_steps}")
+        ray.get(trainer.set_total_train_steps.remote(total_train_steps, total_optimizer_steps))
+
+        # Preserve continuous trainer allocation: trainer GPU workers are created
+        # before rollout GPU workers, but their schedulers now see the final horizon.
+        ray.get(trainer.init_workers.remote())
+        ray.get(rollouter.init_workers.remote())
+        ray.get(rollouter.set_max_required_samples.remote())
+        print("[ASYNC MAIN] Fully async workers initialized successfully")
 
     def _run_training_loop(self):
         self.running = True

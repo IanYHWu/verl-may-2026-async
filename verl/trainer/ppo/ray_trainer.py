@@ -42,6 +42,7 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.critic_utils import prepare_critic_worker_config_kwargs
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -69,7 +70,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.workers.config import DistillationConfig, EngineConfig
+from verl.workers.config import DistillationConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
@@ -724,17 +725,7 @@ class RayPPOTrainer:
             from verl.workers.engine_workers import TrainingWorkerConfig
 
             orig_critic_cfg = critic_cfg
-            engine_config: EngineConfig = orig_critic_cfg.engine
-            engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
-            engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
-
-            critic_cfg = TrainingWorkerConfig(
-                model_type="value_model",
-                model_config=orig_critic_cfg.model,
-                engine_config=engine_config,
-                optimizer_config=orig_critic_cfg.optim,
-                checkpoint_config=orig_critic_cfg.checkpoint,
-            )
+            critic_cfg = TrainingWorkerConfig(**prepare_critic_worker_config_kwargs(orig_critic_cfg))
 
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls

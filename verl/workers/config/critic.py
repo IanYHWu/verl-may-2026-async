@@ -114,7 +114,9 @@ class CriticConfig(BaseConfig):
             train_batch_size: Training batch size from data config
         """
         if not self.use_dynamic_bsz:
-            if train_batch_size < self.ppo_mini_batch_size:
+            # FullyAsyncRollouter uses train_batch_size=0 as a streaming sentinel;
+            # optimizer batches are assembled from the message queue instead.
+            if train_batch_size != 0 and train_batch_size < self.ppo_mini_batch_size:
                 raise ValueError(
                     f"train_batch_size ({train_batch_size}) must be >= "
                     f"critic.ppo_mini_batch_size ({self.ppo_mini_batch_size})"
