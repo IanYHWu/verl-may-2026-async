@@ -117,7 +117,7 @@ async def compute_score(
                 "judge_error": "missing_think_tag",
                 "had_think_tag": False,
             }
-        judge_input = solution_str[idx + len(THINK_CLOSE_TAG):].lstrip()
+        judge_input = solution_str[idx + len(THINK_CLOSE_TAG) :].lstrip()
 
     fields: dict[str, Any] = {
         "problem": question,
@@ -170,8 +170,7 @@ async def compute_score(
     if raw is None:
         finish_reason = result.get("finish_reason")
         logger.warning(
-            "LLM judge produced unparseable output "
-            "(data_source=%s, finish_reason=%s, head=%r)",
+            "LLM judge produced unparseable output (data_source=%s, finish_reason=%s, head=%r)",
             data_source,
             finish_reason,
             judge_text[:200].replace("\n", " "),
@@ -223,7 +222,11 @@ def _truncate_response_in_prompt(
     response_ids = tokenizer.encode(fields["response"], add_special_tokens=False)
     if len(response_ids) > response_budget:
         response_ids = response_ids[:response_budget]
-        truncated = tokenizer.decode(response_ids, skip_special_tokens=True)
+        # ``fields["response"]`` has already been decoded according to the
+        # reward manager's policy. Do not apply a second special-token filter
+        # here: it would silently remove structural tokens that the caller
+        # deliberately preserved before the input-budget truncation pass.
+        truncated = tokenizer.decode(response_ids, skip_special_tokens=False)
         truncated = truncated + "\n\n[…response truncated for grader budget…]"
         fields = dict(fields)
         fields["response"] = truncated
