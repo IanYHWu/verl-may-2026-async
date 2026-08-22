@@ -105,9 +105,19 @@ class LLMJudgeRewardManager(RewardManagerBase):
         response_length = response_ids.shape[-1]
         valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
         valid_response_ids = response_ids[:valid_response_length]
+        # Structural tokens can BE the thing under judgement. A policy trained to
+        # emit <summary>...</summary> is scored on whether it did, and a scaffold
+        # downstream drops any step whose block is missing -- but if those tags are
+        # registered as special in the tokenizer, decoding with
+        # skip_special_tokens=True deletes them before the judge or a custom
+        # compute_score ever sees them, so the check silently passes or fails on
+        # text the model never produced. Default is unchanged; set
+        # reward.reward_kwargs.judge.skip_special_tokens=false to see raw output.
+        skip_special = bool(self._judge_cfg.get("skip_special_tokens", True))
         response_str = await self.loop.run_in_executor(
             None,
-            lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True),
+            lambda: self.tokenizer.decode(valid_response_ids,
+                                          skip_special_tokens=skip_special),
         )
 
         question = await self.loop.run_in_executor(
