@@ -150,6 +150,7 @@ reward:
       timeout_s: 60
       max_retries: 3
       on_error_score: 0.0
+      response_skip_special_tokens: true      # default; see below
 ```
 
 Set `LLM_JUDGE_API_KEY` in the launcher's environment. The rest of the launcher
@@ -172,6 +173,29 @@ If you don't want this (e.g., model has no thinking section), set
 
 The flag `had_think_tag` (true/false/null) is added to `reward_extra_info`
 for diagnostics.
+
+## Preserving structural tokens in policy responses
+
+By default, `response_skip_special_tokens: true` keeps the historical behavior:
+the policy response is decoded without tokenizer special tokens before it is
+sent to the judge or a custom `compute_score` function.
+
+Set it to `false` when registered special tokens are part of the response being
+graded, such as `<summary>...</summary>` delimiters:
+
+```bash
++reward.reward_kwargs.judge.response_skip_special_tokens=false
+```
+
+The leading `+` is required for a Hydra command-line override because the base
+PPO config does not define `reward_kwargs.judge`. This option affects decoding
+of the **policy response** only; it is distinct from the judge client's
+similarly named generation option.
+
+Disabling the filter preserves every tokenizer special token, including any
+BOS, EOS, or chat-framing tokens present in the sampled response. Custom
+templates and scorers should tolerate those tokens, or the tokenizer should
+register only the structural tokens that need to remain visible.
 
 ## Customizing
 
