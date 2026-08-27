@@ -1,6 +1,6 @@
 # Verl (May 2026 Fork)
 
-A fork of [verl](https://github.com/volcengine/verl) tracked against May 2026
+A fork of [verl](https://github.com/verl-project/verl) tracked against May 2026
 upstream HEAD, with the patches needed to run **Qwen3.5** RL with the
 **fully-async** trainer/rollouter pipeline. Validated end-to-end on **B200
 (SM100 / Blackwell)** and **H100 (SM90 / Hopper)** GPUs. Headline additions
@@ -8,13 +8,15 @@ on top of upstream:
 
 - **Qwen3.5 hybrid attention (dense + GatedDeltaNet) trains end-to-end** with
   Megatron-Core + mbridge in BSHD layout. The GDN linear-attention path
-  rejects packed (THD) sequences, so we route Qwen3.5 through a non-VL
-  forward and pad statically. Architecture and patch rationale in
-  [Qwen3.5 limitations](#qwen35-limitations--patch-rationale) below.
+  in the pinned Megatron-Core 0.16.1 stack rejects packed (THD) sequences,
+  so we route dense text-only Qwen3.5 through a non-VL forward and use padded
+  BSHD. The complete FSDP/Megatron settings, FP32-accumulating fused-CE paths,
+  and architecture rationale are in
+  [`docs/training_qwen35.md`](docs/training_qwen35.md).
 - **Async (decoupled trainer/rollouter) is the default for long-context RL.**
   We've validated Qwen3.5-4B on `fully_async_policy` Mode 1 (on-policy
-  pipeline) and Mode 4 (async stream + partial rollout) end-to-end at 40k
-  and 65k response lengths. Throughput data — including a Mode 4 vs
+  pipeline) at 40k responses and Mode 4 (async stream + partial rollout) at
+  40k and 65k. Throughput data — including a Mode 4 vs
   colocate comparison on H100 and a model-size / context / concurrency
   sweep on B200 — is in [`docs/benchmark.md`](docs/benchmark.md).
 - **LLM-as-judge reward manager.** A new `llm_judge` reward manager calls a
@@ -24,17 +26,19 @@ on top of upstream:
   Details in [`verl/utils/judge/README.md`](verl/utils/judge/README.md).
 
 > **Tested with Megatron only.** The FSDP path likely still works (we
-> haven't broken it), but none of our changes have been validated against it.
-> Reach for this fork if you specifically need Qwen3.5 + Megatron + async on
-> Blackwell; otherwise stock upstream verl will probably do.
+> haven't broken it), and its implemented Qwen3.5 settings are documented, but
+> none of our changes have been validated against it end to end.
+> This fork's compatibility claims apply to its pinned May 2026 stack. For a
+> new deployment, compare against current upstream as its Qwen3.5 and
+> Megatron-Core support has continued to evolve.
 
 ## Install
 
 The B200 / H100 + Megatron + Qwen3.5 stack is non-trivial to assemble. We
 ship an end-to-end installer at
 [`scripts/install_verl_megatron.sh`](scripts/install_verl_megatron.sh) that
-performs every step below in order and aborts on the first failure so you
-can re-run from where it stopped.
+performs every step below in order and stops when an invoked step reports a
+failure, so you can correct the environment and re-run it.
 
 ```bash
 conda create -n verl_megatron python=3.10
@@ -51,8 +55,10 @@ source dominate).
 | Component | Version |
 |---|---|
 | python | 3.10 |
+| CUDA toolkit | 12.8 |
 | torch | 2.10.0 |
 | triton | 3.6.0 |
+| transformers | 5.5.4 |
 | transformer_engine | 2.13.0 (cu12, source build) |
 | flash_attn | 2.8.3 (sm100 source build for B200) |
 | megatron-core | 0.16.1 |
@@ -65,7 +71,7 @@ source dominate).
 
 ### What the installer does
 
-The installer is structured as 10 ordered, idempotent-on-rerun steps. If
+The installer is structured as 10 ordered, best-effort rerunnable steps. If
 you'd rather run them by hand, the same steps are reproduced here.
 
 1. **`pip install nvidia-cudnn-cu12`.** TransformerEngine `dlopen`s
@@ -121,8 +127,9 @@ NCCL_LOC=$(pip show nvidia-nccl-cu12  | grep Location | cut -d' ' -f2)
 export LD_LIBRARY_PATH=$CUDNN_LOC/nvidia/cudnn/lib:$NCCL_LOC/nvidia/nccl/lib:$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 ```
 
-The launchers in `scripts/sample_scripts/` set this themselves at the top
-of each file. The installer prints this snippet at the end as a reminder.
+The hardware-specific async launchers set this themselves. Other launchers,
+including the basic colocate example, expect it in the calling environment.
+The installer prints this snippet at the end as a reminder.
 
 ### Sanity check
 
@@ -152,8 +159,10 @@ verl/utils/reward_score/math_proof.py   # async compute_score for rubrics
 verl/experimental/reward_loop/reward_manager/
   llm_judge.py              # the LLMJudgeRewardManager class
 docs/
+  training_qwen35.md       # Qwen3.5 FSDP/Megatron settings + constraints
   advance/fully_async.md    # upstream's async-training doc
   benchmark.md              # H100 Mode 4 vs colocate, B200 Mode 4 sweep
+  quantized_rl_learnings.md # FP8/NVFP4 bring-up notes and compatibility
 scripts/data/
   convert_fineproof_to_dapo.py  # parquet → DAPO chat format converter
 scripts/sample_scripts/     # portable launcher templates
@@ -171,7 +180,10 @@ scripts/sample_scripts/     # portable launcher templates
 All launchers below are thin wrappers around `python -m verl.trainer.main_ppo`
 (colocate path) or `python -m verl.experimental.fully_async_policy.fully_async_main`
 (async path), with the Qwen3.5-specific Hydra overrides pre-set. See the
-script you're running for the full command.
+script you're running for the full command. Before adapting one, read
+[`docs/training_qwen35.md`](docs/training_qwen35.md); in particular, export
+`VERL_MEGATRON_MEM_EFFICIENT_CE=1` to enable the BSHD-compatible
+FP32-accumulating CE path.
 
 ### Colocate (hybrid engine)
 
@@ -180,6 +192,7 @@ Trainer and rollout share the same GPUs via vLLM's hybrid engine.
 ```bash
 # Set HF_MODEL_PATH and TRAIN_FILE (DAPO-format parquet) as env vars,
 # or edit the defaults at the top of the script.
+VERL_MEGATRON_MEM_EFFICIENT_CE=1 \
 TRAIN_FILE=/path/to/train.parquet \
     bash scripts/sample_scripts/qwen35_4b_32k_colocate.sh
 ```
@@ -195,35 +208,41 @@ operating mode (see [`docs/advance/fully_async.md`](docs/advance/fully_async.md)
 
 - `async_training.trigger_parameter_sync_step` — local grad updates per param
   sync. `=1` is on-policy, larger is more off-policy.
-- `async_training.staleness_threshold` — fraction of stale (older-version)
-  trajectories the rollouter is allowed to ship. `0.0` is strict on-policy,
-  `0.5` is the validated Mode 4 default.
+- `async_training.staleness_threshold` — maximum proportion of stale samples
+  that training may consume; it also expands the rollouter's between-sync
+  sample budget. `0.0` refuses stale samples; `0.5` is the validated Mode 4
+  setting.
 - `async_training.partial_rollout` — interrupt and resume in-flight rollouts
   during param sync (only matters when `staleness_threshold > 0`).
 
 **Mode 1 — on-policy pipeline** (`trigger=1`, `staleness=0`,
-`partial_rollout=False`). Cleanest reward signal; matches colocate within
-~5pp at matched step counts. Use as the async sanity baseline.
+`partial_rollout=False`). This is the strict freshness configuration and the
+recommended async sanity baseline.
 
 ```bash
+VERL_MEGATRON_MEM_EFFICIENT_CE=1 \
 TRAIN_FILE=/path/to/train.parquet \
-    bash scripts/sample_scripts/qwen3_4b_inst_acemath_async_mode1.sh
+    bash scripts/sample_scripts/qwen35_4b_dapo_async_mode1_40k.sh
 ```
 
-The Mode 1 reference config (Qwen3-4B-Instruct on AceMath DAPO, 4 trainer +
-4 rollout, 16k responses, GRPO with DAPO clip-higher 0.20/0.28, lr=1e-6,
-wd=0.01, mbsz=32, n=8, 100 cycles → 200 grad updates) is set inside the
-launcher itself.
+The Qwen3.5 Mode 1 reference config uses 4 trainer + 4 rollout B200s, 40k
+responses, GRPO with DAPO clip-higher 0.20/0.28, lr=1e-6, wd=0.01, mbsz=32,
+n=8, and 50 cycles → 100 grad updates. The launcher exposes its main sizing
+and schedule values as environment variables.
 
 **Mode 4 — async stream pipeline + partial rollout** (`trigger=4`,
-`staleness=0.5`, `partial_rollout=True`, `require_batches=1`). Best
-throughput on long-response workloads; tolerates a small amount of staleness
-in exchange for keeping both pools saturated. At 32k responses, Mode 4 ran
-~1.6–1.8× faster than colocate on Qwen3.5-4B/9B/27B.
+`staleness=0.5`, `partial_rollout=True`, `require_batches=1`). Designed to
+hide long rollout latency; it tolerates some staleness in exchange for trying
+to keep both pools saturated. Performance is workload and
+topology dependent: the measured H100 4B run tied colocate within 1%, while
+H100 9B favored colocate; the B200 study covers Mode 4 scaling at 4B, 9B, and
+27B. See [`docs/benchmark.md`](docs/benchmark.md) instead of assuming a fixed
+speedup.
 
-To build a Mode 4 launcher, take the Mode 1 launcher and override
-`TRIGGER_SYNC_STEP=4 STALENESS_THRESHOLD=0.5 PARTIAL_ROLLOUT=True
-REQUIRE_BATCHES=1`.
+The Qwen3.5 Mode 4 launcher is
+`scripts/sample_scripts/qwen35_4b_dapo_async_mode4_40k.sh`. Its defaults can
+be changed with `TRIGGER_SYNC_STEP`, `STALENESS_THRESHOLD`,
+`PARTIAL_ROLLOUT`, and `REQUIRE_BATCHES` environment variables.
 
 ### Health checks during training
 
@@ -233,14 +252,20 @@ The async path emits the standard verl signals plus a few we lean on:
   toward 1e-2+, the rollouter isn't getting fresh weights — sync is broken.
 - `timing_s/param_sync` non-zero per cycle confirms the
   `CheckpointEngineManager` NCCL+IPC path is doing real work.
-- `critic/score/mean` trends up over 20–30 grad updates — actual learning.
+- `fully_async/processing_time/tp99` and
+  `fully_async/rollouter/idle_ratio` expose long-tail rollout latency and
+  rollouter under-utilization.
+- `critic/score/mean` should be finite and consistent with the configured
+  reward scale. Its trend is task-dependent; it is not by itself proof that
+  weight synchronization is healthy.
 
 ## Reducing memory pressure
 
-Long-context RL on Qwen3.5 burns memory on three fronts: optimizer state
-(Adam moments, ~12 bytes/param), activations during the trainer's backward
-pass, and the rollouter's vLLM KV cache. The knobs below are listed roughly
-in order of "free" → "expensive in throughput". Stack them as needed.
+Long-context RL on Qwen3.5 burns memory on three fronts: optimizer and master
+parameter state (roughly 12 bytes/parameter for FP32 master weights plus FP32
+Adam moments before sharding), activations during the trainer's backward pass,
+and the rollouter's vLLM KV cache. The knobs below are listed roughly in order
+of "free" → "expensive in throughput". Stack them as needed.
 
 ### Activation checkpointing (recompute)
 
@@ -256,24 +281,25 @@ actor_rollout_ref.actor.megatron.override_transformer_config:
 ```
 
 `full` + `uniform` recompute_method + `recompute_num_layers=1` is the most
-aggressive setting — every layer is re-run during backward. For shorter
-contexts where you have memory headroom, `recompute_num_layers=2` (half
-the recompute cost, slightly more activation memory) is a reasonable
-intermediate.
+fine-grained full-recompute setting: each layer is its own checkpointed unit.
+With `uniform`, `recompute_num_layers=2` checkpoints two-layer units; it saves
+fewer boundary activations but still recomputes all layers during backward. It
+does not halve recompute FLOPs. Use `block` or selective recomputation if the
+goal is to recompute only part of the model.
 
 ### Optimizer state offload (Adam moments → CPU)
 
-Adam's first/second moment buffers double the parameter footprint. With
-distributed-Adam they're sharded, but at 4B params still ~24 GiB sharded
-2-way. Offloading them to CPU is the single biggest GPU-memory win for
-single-trainer-pool runs:
+FP32 Adam moments plus master-parameter state are large even after distributed
+optimizer sharding: at 4B parameters, 12 bytes/parameter is roughly 24 GB per
+rank when sharded two ways. Offloading optimizer work and state to CPU is the
+single biggest GPU-memory win for single-trainer-pool runs:
 
 ```yaml
 actor_rollout_ref.actor.optim:
   override_optimizer_config:
     optimizer_cpu_offload: true              # move Adam state to CPU
     optimizer_offload_fraction: 1            # 0.0–1.0; 1.0 = all of it
-    use_precision_aware_optimizer: true      # fp32 master, bf16 grads
+    use_precision_aware_optimizer: true      # required by MCore CPU-offload path
     overlap_cpu_optimizer_d2h_h2d: true      # hide PCIe transfer behind compute
 ```
 
@@ -299,17 +325,17 @@ because the trainer pool isn't competing with vLLM for memory. In
 
 ### Sequence parallel (TP-side)
 
-Megatron's sequence parallel splits the activations along the sequence
-dimension within each tensor-parallel group, cutting per-rank activation
-memory by `TP×`. It's enabled automatically when `TP > 1` and the model
-opts in; you'll see `sequence_parallel=True` in the printed
-`Qwen3_5VLTransformerConfig`. The bundled launchers all use
-`tensor_model_parallel_size=2`, so SP is on by default.
+Megatron's sequence parallel splits eligible activations along the sequence
+dimension within each tensor-parallel group, reducing their per-rank
+duplication. It is enabled by default when `TP > 1` and automatically disabled
+when TP is 1. The bundled Qwen3.5 launchers use
+`tensor_model_parallel_size=2`, so Megatron SP is on by default.
 
-> Sequence parallel ≠ context parallel. CP would split the sequence
-> *across* TP groups (not within them), but it requires THD packing,
-> which Qwen3.5's GDN rejects. CP must stay at 1 — see
-> [Qwen3.5 limitations](#qwen35-limitations--patch-rationale).
+> Sequence parallel is not context parallel. CP is an independent parallel
+> dimension that partitions context computation and is the closer Megatron
+> analogue to Ulysses. CP > 1 has not been validated for Qwen3.5 in the pinned
+> MCore stack, so keep it at 1. See
+> [`docs/training_qwen35.md`](docs/training_qwen35.md#recommended-settings).
 
 ### vLLM KV cache budget
 
@@ -318,21 +344,23 @@ for its KV cache:
 
 ```yaml
 actor_rollout_ref.rollout:
-  gpu_memory_utilization: 0.7    # 0.7 leaves ~30% for the trainer / Megatron
+  gpu_memory_utilization: 0.7    # leave headroom outside vLLM's KV cache
   enable_chunked_prefill: true    # smaller per-step prefill chunks
   enforce_eager: false            # let vLLM compile cudagraphs
 ```
 
-For Mode 4 with 65k responses on B200 we bump this to 0.85; for colocate
-where the trainer also lives on the rollout GPUs, keep it ≤ 0.7.
+For Mode 4 with 65k responses on dedicated B200 rollout GPUs we bump this to
+0.85. In colocate mode the trainer shares those GPUs, so keep it ≤ 0.7.
 
 ### Reducing micro-batch size
 
-Qwen3.5 already requires `ppo_micro_batch_size_per_gpu=1` because BSHD
-forces static batches; you can't go lower. If a single prompt's longest
-response still doesn't fit, the only knobs are dropping the response
-length cap, dropping `tensor_model_parallel_size` (more shards), or moving
-to a bigger GPU.
+The bundled long-context Qwen3.5 launchers use
+`ppo_micro_batch_size_per_gpu=1`, but BSHD does not semantically require a
+static batch size of one. If a single sample still does not fit, reduce the
+response-length cap, increase Megatron tensor parallelism to create more
+parameter shards, enable stronger recomputation/offload, or use a larger GPU.
+Reducing tensor parallelism creates fewer shards and generally increases
+per-rank model memory.
 
 ### Quick recipe by GPU
 
@@ -367,6 +395,7 @@ reward:
       top_p: 1.0
       reasoning_effort: medium               # gpt-oss-style
       strip_thinking: true                   # default; see judge README
+      response_skip_special_tokens: false    # preserve structural policy tags
       max_concurrency: 16
       timeout_s: 180
       on_error_score: 0.0
@@ -375,7 +404,10 @@ reward:
 By default the judge looks for the *last* `</think>` tag in the policy's
 response and only sends what comes after to the grader. If `</think>` is
 missing the reward is forced to `on_error_score` (default 0) — we fail
-closed rather than grading the raw chain of thought.
+closed rather than grading the raw chain of thought. Set
+`response_skip_special_tokens=false` when structural tags are registered as
+tokenizer special tokens; otherwise decoding can erase them before the judge
+or custom scoring code sees the response.
 
 Customizable extension points:
 - **Prompt templates** in `verl/utils/judge/templates/` (sentinel-based
@@ -413,7 +445,7 @@ my_recipe/                         # your recipe
   trainer.py                       # MyRayPPOTrainer(RayPPOTrainer)
   rollout.py                       # MyRollout — the actual custom rollout
   config/
-    my_recipe_trainer.yaml         # extends ppo_megatron_trainer.yaml
+    my_recipe_trainer.yaml         # extends ppo_trainer.yaml
   scripts/
     qwen35_4b_my_recipe.sh         # launcher
 ```
@@ -422,7 +454,7 @@ Why a sibling package, not a subdir of `verl/`: keeps your code separable
 from the framework, so you can rebase against upstream verl without
 conflicts.
 
-### Three pieces
+### Five pieces
 
 **1. Custom rollout class** (`my_recipe/rollout.py`).
 
@@ -462,9 +494,10 @@ class MyRollout:
 #### What `generate_sequences` must return
 
 Return a `DataProto` (verl's `{batch, non_tensor_batch, meta_info}`
-container) with these **required** fields. The trainer reads them
-directly during reward, log-prob recompute, advantage, and update
-phases — get the shapes wrong and downstream collation breaks.
+container) with these core fields. The trainer reads them directly during
+reward, log-prob recompute, advantage, and update phases — get the shapes
+wrong and downstream collation breaks. `response_mask` is optional only in
+the simple single-turn case described below.
 
 `batch.batch` (a `TensorDict`):
 
@@ -498,8 +531,9 @@ manager can read them downstream. The agent loop additionally adds:
 
 - `timing` — dict of stage timings; trainer pops it into its own timing
   log. Optional but useful.
-- `temperature` — set by the rollouter to whatever sampling temperature
-  it used; the trainer reads it for log-prob recompute.
+- `temperature` — the trainer fills this from the rollout configuration before
+  log-prob recompute; a custom trainer must preserve the actual sampling
+  temperature if it differs.
 
 **Reference implementation:**
 `AgentLoopWorker._postprocess` in
@@ -582,7 +616,8 @@ Inherit the base Hydra config and add recipe-specific knobs:
 
 ```yaml
 defaults:
-  - /ppo_megatron_trainer    # the upstream base config
+  - /ppo_trainer
+  - override /model_engine: megatron
   - _self_
 
 my_recipe:
@@ -610,106 +645,72 @@ python -m my_recipe.main \
 ### Async runs
 
 If you're running async (Mode 1/4), the entry point is
-`verl.experimental.fully_async_policy.fully_async_main` instead and you
-inherit from `FullyAsyncTrainer` (in
-`verl/experimental/fully_async_policy/fully_async_trainer.py`). The
-rollout-wrap pattern is identical — `FullyAsyncTrainer` also calls into
-the rollouter through a manager that you can swap in `init_workers`.
+`verl.experimental.fully_async_policy.fully_async_main`. The live training
+rollout manager belongs to the separate `FullyAsyncRollouter`, not the
+trainer, so wrapping the trainer's `async_rollout_manager` does not customize
+training rollouts. Provide a compatible manager class and configure its fully
+qualified name instead:
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    agent:
+      agent_loop_manager_class: my_recipe.rollout.MyFullyAsyncManager
+```
+
+The rollouter loads this class and calls its async `create(...)` factory with
+the config, fully-async LLM client, and optional reward-loop handles. Subclass
+or mirror `FullyAsyncAgentLoopManager` so `generate_sequences_single` and
+statistics remain compatible. Trainer-side validation currently creates the
+standard `AgentLoopManager`, so validate a custom fully-async rollout through
+the rollouter unless that validation path is customized too.
 
 ## Limitations
 
 **Tested only with Megatron + vLLM.** The FSDP backend should still work but
 nothing in this fork has been validated against it.
 
-### Qwen3.5 limitations & patch rationale
+### Qwen3.5 layout and precision constraints
 
-Megatron-Core's `GatedDeltaNet` (the linear-attention path in Qwen3.5's
-hybrid attention layers) does not accept packed sequences:
-`NotImplementedError: GDN does not support packed sequence for now`.
-This cascades into the constraints below.
+The verified Megatron-Core 0.16.1 stack does not support Qwen3.5 GDN with
+packed THD sequences. Later upstream MCore work does not change the behavior
+of this pinned environment. The safe invariant for both FSDP and Megatron is
+`actor_rollout_ref.model.use_remove_padding=false`; Megatron launchers should
+also set `actor_rollout_ref.actor.megatron.use_remove_padding=false`.
 
-#### THD vs BSHD
+FSDP obtains memory-efficient FP32-accumulating CE with
+`use_fused_kernels=true` and the `triton` backend. Stock Megatron fused mode
+requires THD, so this fork instead uses
+`VERL_MEGATRON_MEM_EFFICIENT_CE=1` with `use_fused_kernels=false`. These paths
+keep BF16 model weights and hidden states; they retain the output-projection
+accumulator and CE statistics in FP32 rather than creating an FP32-parameter
+head.
 
-verl defaults to **THD** activations
-(`(total_tokens, num_heads, head_dim)` — packed variable-length sequences
-with `cu_seqlens` boundaries) when `actor.megatron.use_remove_padding=true`.
-THD is efficient but not all attention variants consume it. Qwen3.5 forces
-**BSHD** (`(batch, seq_len, num_heads, head_dim)` — padded fixed-shape) so
-the GDN layer can run.
+Dynamic batching is independent of packing, and BSHD does not intrinsically
+require a microbatch size of one. The bundled long-context launchers disable
+dynamic batching and use microbatch one as conservative, validated defaults.
+FSDP Ulysses must stay at one because the current integration couples it to
+remove-padding. Megatron context parallelism above one is not validated for
+Qwen3.5 in this stack; Megatron's TP-side sequence parallelism remains usable.
 
-#### Required Hydra overrides for Qwen3.5
+Dense `Qwen3_5ForConditionalGeneration` is deliberately routed through the
+non-VL forward for text-only BSHD training. Actual image/video training and
+Qwen3.5 MoE variants are outside the validated scope. Transformers 5.x
+natively supports the official architecture, and current tokenizer helpers
+normalize both flat token lists and `BatchEncoding`; the launchers' explicit
+`return_dict=false` remains compatible but is no longer a hard requirement.
 
-These apply on top of the stock `verl/trainer/config/ppo_megatron_trainer.yaml`
-config. The bundled launchers in `scripts/sample_scripts/` already set them.
-
-| Override | Reason |
-|---|---|
-| `actor.megatron.use_remove_padding=false` | BSHD forward (GDN refuses THD). |
-| `model.use_remove_padding=false` | The fully-async path reads from `model.use_remove_padding` (separate from `actor.megatron.use_remove_padding`); both must be set. |
-| `actor.megatron.use_mbridge=true` | mbridge owns the Megatron ↔ HF Qwen3.5 weight bridge. |
-| `actor.megatron.vanilla_mbridge=true` | Routes through the non-VL converter. |
-| `actor.use_dynamic_bsz=false` | BSHD requires static micro batches. |
-| `actor.ppo_micro_batch_size_per_gpu=1` | Same; pad to longest in the batch. |
-| `rollout.log_prob_use_dynamic_bsz=false` | Same on the log-prob recompute path. |
-| `rollout.log_prob_micro_batch_size_per_gpu=1` | Same. |
-| `actor.freeze_vision_tower=true` | mbridge builds the VL stack even for text-only RL; freezing skips its optimizer / grad bookkeeping. |
-| `actor.optim.override_optimizer_config.optimizer_cpu_offload=true` | Required to fit 4B with long contexts on a single trainer pool. |
-| `tensor_model_parallel_size=2`, `pipeline_model_parallel_size=1` | Validated. |
-| `context_parallel_size=1` | **CP is not supported** — see below. |
-| `model.trust_remote_code=true` | Qwen3.5 config has custom Python. |
-
-#### No context parallel
-
-Context parallel (CP) in Megatron requires THD packing. Since Qwen3.5
-forces BSHD, `context_parallel_size` must stay at 1. Sequence parallel (the
-TP-side variant) is unaffected and remains enabled by default.
-
-#### In-tree patches under `verl/`
-
-These are already in this fork; you don't need to apply them by hand.
-
-- **`verl/utils/model.py`** — `transformers` 5.x dropped
-  `AutoModelForVision2Seq`; aliased to `AutoModelForImageTextToText` so verl
-  imports still work.
-- **`verl/models/mcore/registry.py`** — Qwen3.5 dense
-  (`Qwen3_5ForConditionalGeneration`) is deliberately **not** in
-  `SupportedVLM`. That routes it through `model_forward_gen(False)` (the
-  non-VL forward) so the training-side dispatch can take BSHD. The VL
-  forward would force THD, which the GDN rejects.
-- **`verl/models/mcore/model_forward.py`** (BSHD branch) —
-  - Loosened `assert not vision_model` so a VL-routed forward can take BSHD
-    when the batch is text-only.
-  - **MRoPE fix**: when `tf_config.mrope_section` is set
-    (Qwen3.5 / Qwen3-VL), pass `position_ids=None` so `Qwen3_5VLModel`
-    auto-computes 3-D position ids via `get_rope_index`. verl's 1-D
-    `position_ids` would otherwise trip
-    `mbridge/.../rope_utils.py` with
-    `IndexError: too many indices for tensor of dimension 2`.
-- **`verl/experimental/agent_loop/agent_loop.py`** `_compute_position_ids` —
-  - Text-only fast path: when no `image_grid_thw` / `video_grid_thw` is
-    present, skip multimodal RoPE and fall back to
-    `compute_position_id_with_mask(attention_mask)`.
-  - **`mm_token_type_ids` synthesis**: transformers 5.x made it a required
-    positional arg of `Qwen3VLModel.get_rope_index`. The patch synthesizes
-    it from `input_ids` (0 for text, vision-start-token-id for vision
-    tokens) so the call succeeds.
-
-#### Tokenizer compatibility (transformers 5.x)
-
-Any caller of `tokenizer.apply_chat_template(..., tokenize=True)` should
-pass `return_dict=False`. transformers 5.x changed the default return to a
-`BatchEncoding` instead of a flat list of ids, breaking
-`torch.tensor(ids, dtype=torch.long)` with
-`TypeError: 'str' object cannot be interpreted as an integer`. The
-launchers append `+data.apply_chat_template_kwargs.return_dict=false` for
-this reason.
+See [`docs/training_qwen35.md`](docs/training_qwen35.md) for the complete
+recommended-settings table, copyable FSDP and Megatron overrides, CE
+collective explanation, checkpoint notes, and troubleshooting.
 
 ### Async-mode caveats
 
 - The fully-async trainer logs metrics at the end of every grad update *and*
-  at every param-sync cycle. Cycle-level keys (e.g. `processing_time/p99`,
-  `rollouter/idle_ratio`) only land at sync events; per-step keys (loss,
-  reward, log_ppl_diff) land every step.
+  at every param-sync cycle. Cycle-level keys such as
+  `fully_async/processing_time/tp99` and
+  `fully_async/rollouter/idle_ratio` only land at sync events; per-step keys
+  such as loss, reward, and `rollout_corr/log_ppl_diff` land every step.
 - `staleness_threshold > 0` produces stale trajectories — they show up
   in the `fully_async/count/stale_trajectory_processed` counter. With
   `partial_rollout=True` + the canonical 0.5 threshold this is well-behaved
@@ -717,6 +718,9 @@ this reason.
 
 ## Pointers
 
+- [`docs/training_qwen35.md`](docs/training_qwen35.md) — the authoritative
+  Qwen3.5 text-training guide: BSHD requirements, FSDP/Megatron settings,
+  FP32-accumulating fused CE, parallelism limits, and troubleshooting.
 - [`scripts/sample_scripts/`](scripts/sample_scripts/) — portable launcher
   templates for the validated configurations (colocate / Mode 1 / Mode 4 on
   Qwen3-Instruct + AceMath, Qwen3.5 + DAPO Math, Qwen3.5 + Fineproofs with
