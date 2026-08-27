@@ -35,6 +35,7 @@ from verl.utils.device import get_device_name, get_torch_device
 from verl.utils.fs import is_non_local, local_mkdir_safe
 from verl.utils.logger import log_with_rank
 from verl.utils.megatron.dist_checkpointing import load_dist_checkpointing, save_dist_checkpointing
+from verl.utils.megatron_optimizer_compat import apply_non_tensor_optimizer_state_guard, is_megatron_core_0161
 from verl.utils.megatron_utils import (
     get_dist_checkpoint_path,
     get_hf_model_checkpoint_path,
@@ -42,6 +43,12 @@ from verl.utils.megatron_utils import (
 )
 
 from .checkpoint_manager import BaseCheckpointManager
+
+# Applied after normal imports so a vulnerable installation cannot silently
+# continue without the guard. Each worker imports this manager independently.
+if is_megatron_core_0161(megatron.core.__version__):
+    if not apply_non_tensor_optimizer_state_guard():
+        raise RuntimeError("Failed to install required Megatron-Core 0.16.1 optimizer-state compatibility guard")
 
 # Setup logging
 logger = logging.getLogger(__file__)
