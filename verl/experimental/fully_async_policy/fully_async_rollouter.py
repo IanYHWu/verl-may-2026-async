@@ -761,11 +761,26 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """Process a single sample streamingly"""
         # Calling asynchronous generation methods
         ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        # A custom rollout manager may return metrics for THIS completed group.
+        # Keep them on RolloutSample rather than DataProto.meta_info: DataProto.concat
+        # cannot preserve distinct per-group dictionaries when the trainer assembles
+        # required_samples queue entries. The sample-local marker lets batch assembly
+        # distinguish these values from historical rolling-window snapshots.
+        sample_rollout_metrics = ret.meta_info.pop("rollout_metrics", None)
         rollout_sample.full_batch = ret
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
         rollout_sample.rollout_status = await self.get_statistics()
+        if sample_rollout_metrics is not None:
+            if not isinstance(sample_rollout_metrics, dict):
+                raise TypeError(
+                    "generate_sequences_single meta_info['rollout_metrics'] must be a dict, "
+                    f"got {type(sample_rollout_metrics).__name__}"
+                )
+            rollout_sample.rollout_status.update(sample_rollout_metrics)
+            rollout_sample.rollout_status["manager_metric_keys"] = sorted(sample_rollout_metrics)
+            rollout_sample.rollout_status["manager_metrics_are_sample_local"] = True
 
         success = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),

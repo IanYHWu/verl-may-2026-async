@@ -48,6 +48,64 @@ class ValidateMetrics:
     val_generations: Optional[list[tuple]] = None
 
 
+def aggregate_rollout_statuses(rollout_samples: list[RolloutSample]) -> dict[str, Any]:
+    """Build telemetry for the exact queue samples consumed by one trainer batch.
+
+    Monitor/counter fields are snapshots, so retain the freshest (last-completed)
+    sample as before. Metrics declared by a custom rollout manager are different:
+    when every sample carries a sample-local payload, average those values across
+    exactly ``rollout_samples``. This prevents a stale rolling-window snapshot from
+    being logged as the reward of a newly trained batch after resume.
+
+    Old queue checkpoints do not contain sample-local payloads. For a mixed/legacy
+    batch, deliberately omit manager metrics rather than publish a value known not to
+    describe the batch; training data and gradients remain unchanged. The coverage
+    diagnostic makes that one-step omission explicit.
+    """
+    if not rollout_samples:
+        raise ValueError("Empty rollout_samples provided for status aggregation")
+
+    statuses = [sample.rollout_status or {} for sample in rollout_samples]
+    latest = dict(statuses[-1])
+    manager_keys = set()
+    sample_local_statuses = []
+    for status in statuses:
+        manager_keys.update(status.get("manager_metric_keys") or [])
+        if status.get("manager_metrics_are_sample_local") is True:
+            sample_local_statuses.append(status)
+
+    coverage = len(sample_local_statuses) / len(statuses)
+    # Internal protocol markers are not user metrics.
+    latest.pop("manager_metrics_are_sample_local", None)
+
+    if len(sample_local_statuses) == len(statuses):
+        aggregated_keys = set()
+        for key in manager_keys:
+            values = [
+                status[key]
+                for status in sample_local_statuses
+                if key in status and isinstance(status[key], int | float | np.number)
+            ]
+            if values:
+                latest[key] = float(np.mean(values))
+                aggregated_keys.add(key)
+            else:
+                latest.pop(key, None)
+        if aggregated_keys:
+            latest["manager_metric_keys"] = sorted(aggregated_keys)
+        else:
+            latest.pop("manager_metric_keys", None)
+    else:
+        # The latest legacy status contains a rolling manager snapshot. Remove every
+        # declared manager field so it cannot masquerade as this batch's reward.
+        for key in manager_keys:
+            latest.pop(key, None)
+        latest.pop("manager_metric_keys", None)
+
+    latest["manager_metric_sample_coverage"] = coverage
+    return latest
+
+
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
     """
     Similar to the logic of ray_trainer._prepare_generate_batch, but for a single sample.
@@ -117,13 +175,7 @@ def assemble_batch_from_rollout_samples(
     print(f"[BatchUtils] Assembling batch from {len(rollout_samples)} RolloutSample objects")
 
     rollout_samples_batch = []
-    # Use the LAST (freshest) sample's status, not the first. rollout_status is captured
-    # per-sample at generation time (_process_single_sample_streaming); a custom manager
-    # exposing rollout_metrics() (e.g. a rolling window) is sparse/cold for the
-    # first-completed sample, so rollout_samples[0] freezes a stale/empty snapshot
-    # (judge_reward=0, lengths pinned to the first group). The last-completed sample has
-    # the warmest window / most-current counts -> representative of the assembled batch.
-    rollout_status = rollout_samples[-1].rollout_status
+    rollout_status = aggregate_rollout_statuses(rollout_samples)
     # Add a prefix to all rollout_status keys
     rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
 
