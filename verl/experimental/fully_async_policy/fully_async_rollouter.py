@@ -794,6 +794,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     "generate_sequences_single meta_info['rollout_metrics'] must be a dict, "
                     f"got {type(sample_rollout_metrics).__name__}"
                 )
+            # get_statistics() already merged the manager's ROLLING-WINDOW metrics into
+            # this status. Remove them before overlaying this group's own: a key the
+            # group does not emit (a recipe may report some metrics only for some
+            # groups, e.g. a per-problem-type reward) must be ABSENT from its status,
+            # not silently carry the window's stale value into the batch mean.
+            for window_key in rollout_sample.rollout_status.pop("manager_metric_keys", None) or []:
+                rollout_sample.rollout_status.pop(window_key, None)
             rollout_sample.rollout_status.update(sample_rollout_metrics)
             rollout_sample.rollout_status["manager_metric_keys"] = sorted(sample_rollout_metrics)
             rollout_sample.rollout_status["manager_metrics_are_sample_local"] = True

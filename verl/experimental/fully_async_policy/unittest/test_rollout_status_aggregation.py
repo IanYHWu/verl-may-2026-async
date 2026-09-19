@@ -71,3 +71,39 @@ def test_suppresses_stale_manager_metrics_for_legacy_resume_batch():
 def test_rejects_empty_batch():
     with pytest.raises(ValueError, match="Empty rollout_samples"):
         aggregate_rollout_statuses([])
+
+
+def test_a_key_is_averaged_only_over_the_samples_that_declare_it():
+    # A recipe may emit a metric for some groups only (e.g. a per-problem-type reward).
+    # A sample that does not DECLARE the key must not contribute, even if its status
+    # still holds a value under that name (a rolling-window leftover).
+    samples = [
+        sample(
+            {
+                "reward/judge_reward_binary_mean": 1.0,
+                "reward/reward_mean": 1.0,
+                "manager_metric_keys": ["reward/judge_reward_binary_mean", "reward/reward_mean"],
+                "manager_metrics_are_sample_local": True,
+            }
+        ),
+        sample(
+            {
+                "reward/judge_reward_binary_mean": 0.1,  # stale window value, not declared
+                "reward/judge_reward_rubric_mean": 0.3,
+                "reward/reward_mean": 0.3,
+                "manager_metric_keys": ["reward/judge_reward_rubric_mean", "reward/reward_mean"],
+                "manager_metrics_are_sample_local": True,
+            }
+        ),
+    ]
+
+    status = aggregate_rollout_statuses(samples)
+
+    assert status["reward/judge_reward_binary_mean"] == pytest.approx(1.0)
+    assert status["reward/judge_reward_rubric_mean"] == pytest.approx(0.3)
+    assert status["reward/reward_mean"] == pytest.approx(0.65)
+    assert sorted(status["manager_metric_keys"]) == [
+        "reward/judge_reward_binary_mean",
+        "reward/judge_reward_rubric_mean",
+        "reward/reward_mean",
+    ]

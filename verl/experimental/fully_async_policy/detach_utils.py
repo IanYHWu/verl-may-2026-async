@@ -81,10 +81,14 @@ def aggregate_rollout_statuses(rollout_samples: list[RolloutSample]) -> dict[str
     if len(sample_local_statuses) == len(statuses):
         aggregated_keys = set()
         for key in manager_keys:
+            # Only a status that DECLARES the key measured it. A status can also hold
+            # the key as a leftover rolling-window value (queue entries written before
+            # the rollouter stopped overlaying onto the window snapshot).
             values = [
                 status[key]
                 for status in sample_local_statuses
-                if key in status and isinstance(status[key], int | float | np.number)
+                if key in (status.get("manager_metric_keys") or [])
+                and isinstance(status.get(key), int | float | np.number)
             ]
             if values:
                 latest[key] = float(np.mean(values))
