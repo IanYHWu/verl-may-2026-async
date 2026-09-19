@@ -28,6 +28,11 @@ ppo_micro_batch_size_per_gpu: null
 # For flat/multi-row recipes that must control optimizer steps per train step independently
 train_minibatch_rows: null
 
+# Optimizer splitting, independent of async collection. Recipes can default to count.
+train_minibatch_mode: rows
+train_num_minibatches: 1
+batching_metrics: false
+
 # Whether to automatically adjust batch size at runtime
 # oc.select: the default val for ref.log_prob_use_dynamic_bsz
 use_dynamic_bsz: false
@@ -319,4 +324,3 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
-

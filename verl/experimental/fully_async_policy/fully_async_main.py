@@ -16,10 +16,12 @@ import asyncio
 import os
 import socket
 import threading
+import time
 from pprint import pprint
 
 import hydra
 import ray
+from ray.exceptions import ActorUnavailableError
 from omegaconf import OmegaConf
 
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
@@ -167,15 +169,54 @@ class FullyAsyncTaskRunner:
 
         futures = [rollouter_future, trainer_future]
 
+        # Transient-unreachability tolerance. A component actor whose core worker is
+        # saturated (145GB dist-checkpoint save + full CPU optimizer offload, esp. when a
+        # save collides with a validation) can miss the gRPC keepalive ACK window, so the
+        # driver's ray.get raises ActorUnavailableError ("keepalive watchdog timeout
+        # rpc_code: 14"). That is Ray's *retry-me* signal, but the vanilla loop treated it
+        # as fatal -> every such blip killed a multi-hour run (run4 2253679, run5 2270828).
+        # We ride through it: keep waiting on the same future, with a budget that resets
+        # once the actor has been healthy for a while (long ray.wait block before the blip).
+        # A genuinely dead actor raises ActorDiedError (not Unavailable) -> still fatal.
+        max_unavail = int(os.environ.get("ASYNC_ACTOR_UNAVAIL_MAX_RETRIES", "40"))
+        unavail_sleep_s = float(os.environ.get("ASYNC_ACTOR_UNAVAIL_SLEEP_S", "15"))
+        unavail_reset_s = float(os.environ.get("ASYNC_ACTOR_UNAVAIL_RESET_S", "30"))
+        unavail_count = {}
+
         try:
             while futures:
                 # Use ray.wait to monitor all futures and return when any one is completed.
+                _wait_t0 = time.monotonic()
                 done_futures, remaining_futures = ray.wait(futures, num_returns=1, timeout=None)
+                _waited = time.monotonic() - _wait_t0
 
                 for future in done_futures:
                     try:
                         ray.get(future)
                         print("[ASYNC MAIN] One component completed successfully")
+                        unavail_count.pop(future, None)
+                    except ActorUnavailableError as e:
+                        # Healthy for a while before this blip -> reset the budget.
+                        if _waited > unavail_reset_s:
+                            unavail_count[future] = 0
+                        c = unavail_count.get(future, 0) + 1
+                        unavail_count[future] = c
+                        if c > max_unavail:
+                            print(
+                                f"[ASYNC MAIN] actor unavailable {c}x in a row "
+                                f"(>{max_unavail}); giving up: {e}"
+                            )
+                            for remaining_future in remaining_futures:
+                                ray.cancel(remaining_future)
+                            raise
+                        print(
+                            f"[ASYNC MAIN] transient ActorUnavailableError "
+                            f"({c}/{max_unavail}, waited {_waited:.0f}s) -- actor busy "
+                            f"(likely ckpt/optimizer stall); sleeping {unavail_sleep_s:.0f}s "
+                            f"and continuing to wait: {e}"
+                        )
+                        time.sleep(unavail_sleep_s)
+                        remaining_futures.append(future)
                     except Exception as e:
                         print(f"[ASYNC MAIN] Component failed with error: {e}")
                         for remaining_future in remaining_futures:

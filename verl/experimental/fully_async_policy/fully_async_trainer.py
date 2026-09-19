@@ -323,20 +323,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """Resolve DP sizes and validate each role's mini-batch before training starts."""
         n = self.config.actor_rollout_ref.rollout.n
         actor_config = self.config.actor_rollout_ref.actor
-        train_minibatch_rows = actor_config.get("train_minibatch_rows", None)
-        if train_minibatch_rows == 0:
-            actor_mini_rows = None
-        else:
-            actor_mini_rows = (
-                int(train_minibatch_rows) if train_minibatch_rows else actor_config.ppo_mini_batch_size * n
-            )
+        from verl.utils.optimizer_batching import batching_divisor
 
         actor_dp_size = self._get_dp_size(self.actor_wg, "actor")
-        self.actor_batch_divisor = get_role_batch_divisor(
-            role="actor",
-            dp_size=actor_dp_size,
-            mini_batch_rows=actor_mini_rows,
-        )
+        self.actor_batch_divisor = batching_divisor(actor_config, actor_dp_size, n)
 
         self.critic_batch_divisor = None
         if self.use_critic:
@@ -465,7 +455,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.current_param_version % self.config.trainer.test_freq != 0 or self.local_trigger_step > 1:
             await self._fit_update_weights()
             await self._fit_validate()
-        self._fit_save_checkpoint(force=True)
+        await asyncio.to_thread(self._fit_save_checkpoint, True)
 
     async def fit_step(self, batch_dict: dict = None):
         """
@@ -502,7 +492,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self._fit_dump_data(batch)
 
         await self._fit_validate()
-        self._fit_save_checkpoint()
+        # Off-load the (synchronous) checkpoint save to a thread so the trainer's event
+        # loop keeps answering gRPC keepalives during the 145GB dist-ckpt write +
+        # ray.get(rollouter.save_checkpoint). await keeps it synchronous w.r.t. the fit
+        # loop (this coroutine suspends until the save completes -> no weight mutation
+        # mid-save -> consistent checkpoint), but frees the loop meanwhile. This is what
+        # actually failed at run5 pv45: the trainer went ActorUnavailable (keepalive
+        # watchdog) while blocked in this save. Matters most at save_freq=1.
+        await asyncio.to_thread(self._fit_save_checkpoint)
         self._fit_stop_profile()
         self._fit_collect_metrics(batch)
         self._fit_postprocess_step()
@@ -620,9 +617,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
     def _fit_update_actor(self, batch: DataProto) -> DataProto:
         marker = batch.batch.pop(_VALID_ROLLOUT_ROW) if _VALID_ROLLOUT_ROW in batch.batch else None
+        if marker is not None:
+            batch.batch["batching_valid_row"] = marker
         try:
             return super()._fit_update_actor(batch)
         finally:
+            batch.batch.pop("batching_valid_row", None)
             if marker is not None:
                 batch.batch[_VALID_ROLLOUT_ROW] = marker
 
@@ -654,7 +654,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # _get_samples_from_queue, pre-pad — lets _balance_batch's equal_size=True partition
             # see a DP-divisible row count. The validity marker is reordered with every other row
             # field, so critic selection still follows the actor's balanced ordering.
-            if self.config.trainer.balance_batch:
+            if (
+                self.config.trainer.balance_batch
+                and self.config.actor_rollout_ref.actor.get("train_minibatch_mode", "rows") != "count"
+            ):
                 self._balance_batch(batch, metrics=metrics)
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         return batch

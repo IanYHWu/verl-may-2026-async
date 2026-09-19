@@ -159,6 +159,10 @@ class ActorConfig(BaseConfig):
     ppo_micro_batch_size_per_gpu: Optional[int] = None
     ppo_infer_micro_batch_size_per_gpu: Optional[int] = None
     train_minibatch_rows: Optional[int] = None
+    # Optimizer splitting only; independent of async collection's mini_batch_size.
+    train_minibatch_mode: str = "rows"
+    train_num_minibatches: int = 1
+    batching_metrics: bool = False
     use_dynamic_bsz: bool = False
     ppo_max_token_len_per_gpu: int = 16384
     ppo_infer_max_token_len_per_gpu: int = 16384
@@ -228,6 +232,9 @@ class ActorConfig(BaseConfig):
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""
+        from verl.utils.optimizer_batching import batching_divisor
+
+        batching_divisor(self, 1, 1)  # DP divisibility is checked when the actor mesh exists.
         if self.train_minibatch_rows is not None and self.train_minibatch_rows < 0:
             raise ValueError(
                 f"[actor] train_minibatch_rows ({self.train_minibatch_rows}) must be >= 0 "

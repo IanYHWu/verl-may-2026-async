@@ -196,6 +196,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
         self.max_required_samples = None
         self.max_concurrent_samples = None
+        self.dispatch_interval_s = 0.0  # seconds between sample submissions; >0 throttles dispatch bursts
         # queue size
         self.max_queue_size = None
 
@@ -260,6 +261,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * concurrency_multiplier
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
+            self.dispatch_interval_s = float(self.config.async_training.get("dispatch_interval_s", 0.0))
 
             print(
                 f"[FullyAsyncRollouter] required_samples : {self.required_samples} "
@@ -384,7 +386,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 )
 
                 snap = await self.message_queue_client.snapshot()
-                save_message_queue_snapshot(
+                # snapshot() already returned a consistent, locked point-in-time copy of the
+                # (pre-cloudpickled) sample blobs, so the 5.5GB pickle+write can run OFF the
+                # event loop. This matters at save_freq=1: without to_thread the ~minutes-long
+                # write blocks this async actor's loop (the pickle of already-serialized bytes
+                # is I/O-bound, so the GIL is released during the write) and starved its gRPC
+                # keepalive -> ActorUnavailable. await keeps the checkpoint synchronous
+                # (save_checkpoint does not return until the write completes) while freeing the
+                # loop to answer keepalives and keep generation flowing.
+                await asyncio.to_thread(
+                    save_message_queue_snapshot,
                     snap,
                     os.path.join(local_global_step_folder, QUEUE_FILENAME),
                     required_samples=self.required_samples,
@@ -756,6 +767,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     name=rollout_sample.sample_id,
                     task_set=self.active_tasks,
                 )
+            # Throttle dispatch to avoid a connection flood (esp. on resume, when the restored
+            # queue + in-flight would otherwise fire all at once and trip the E-fleet aiohttp/
+            # uvloop client). Outside the lock. No-op at steady state (gated by task completions).
+            if self.dispatch_interval_s > 0:
+                await asyncio.sleep(self.dispatch_interval_s)
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
