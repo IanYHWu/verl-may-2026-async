@@ -1056,6 +1056,10 @@ class RayPPOTrainer:
         When use_prefix_grouper is enabled, uses group-level balancing to keep samples with
         the same uid together on the same rank for prefix sharing optimization.
         """
+        # Count mode plans and balances *optimizer* minibatches immediately before
+        # update_actor; earlier whole-batch sorts must not determine membership.
+        if self.config.actor_rollout_ref.actor.get("train_minibatch_mode", "rows") == "count":
+            return
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
@@ -1197,6 +1201,46 @@ class RayPPOTrainer:
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
+        from verl.utils.optimizer_batching import count_minibatch_order, minibatch_rows
+
+        actor_config = self.config.actor_rollout_ref.actor
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        resolved_rows = minibatch_rows(actor_config, len(batch), dp_size, self.config.actor_rollout_ref.rollout.n)
+        count_mode = actor_config.get("train_minibatch_mode", "rows") == "count"
+        seed = actor_config.get("data_loader_seed", 42)
+        if count_mode:
+            seed = (42 if seed is None else int(seed)) + int(self.global_steps)
+            if getattr(self, "use_prefix_grouper", False):
+                raise ValueError("Count-mode optimizer batching does not support prefix grouping")
+            workloads = calculate_workload(batch.batch["attention_mask"].sum(-1)).tolist()
+            order = count_minibatch_order(
+                workloads, batch.batch["response_mask"].sum(-1).tolist(), dp_size,
+                actor_config.train_num_minibatches, seed,
+                get_seqlen_balanced_partitions if self.config.trainer.balance_batch else None,
+            )
+            # Do not reorder the caller's batch/validity marker (critic and async
+            # bookkeeping may still use its original row order).
+            batch = batch[torch.tensor(order)]
+        monitor_batching = actor_config.get("batching_metrics", False)
+        if monitor_batching:
+            from verl.utils.optimizer_batching import ROLE_NAMES
+
+            if actor_config.loss_agg_mode != "token-mean":
+                raise ValueError("batching_metrics currently describes token-mean loss only")
+            prompt_width = batch.batch["prompts"].shape[-1]
+            attention = batch.batch["attention_mask"]
+            loss_lengths = batch.batch["response_mask"].sum(-1)
+            valid = batch.batch.get("batching_valid_row", loss_lengths > 0)
+            roles = batch.non_tensor_batch.get("batching_role", batch.non_tensor_batch.get("row_role"))
+            role_ids = (
+                [ROLE_NAMES.index(str(r)) if str(r) in ROLE_NAMES else 0 for r in roles]
+                if roles is not None else [0] * len(batch)
+            )
+            batch.batch["batching_row_stats"] = torch.stack(
+                [attention[:, :prompt_width].sum(-1), attention[:, prompt_width:].sum(-1),
+                 loss_lengths, valid.long(), torch.tensor(role_ids, device=attention.device)],
+                dim=-1,
+            ).long()
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
@@ -1218,22 +1262,9 @@ class RayPPOTrainer:
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
-        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
-        # Flat/multi-row recipes may set an explicit row-level optimizer chunk size to
-        # decouple opt-steps-per-train-step from ppo_mini_batch_size (see ActorConfig).
-        # This is the single split site shared by colocate and the fully-async path.
-        train_minibatch_rows = self.config.actor_rollout_ref.actor.get("train_minibatch_rows", None)
-        if train_minibatch_rows == 0:
-            # Full-batch mode: one optimizer step over the whole (already DP-padded) batch. The
-            # pad site (fully_async_trainer / colocate) padded only to DP-divisibility, so a single
-            # minibatch = len(batch) satisfies make_iterator's `batch % mini_batch_size == 0`.
-            ppo_mini_batch_size = int(batch_td.batch_size[0])
-        elif train_minibatch_rows:
-            ppo_mini_batch_size = int(train_minibatch_rows)
+        ppo_mini_batch_size = resolved_rows
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
-        seed = self.config.actor_rollout_ref.actor.data_loader_seed
-        shuffle = self.config.actor_rollout_ref.actor.shuffle
+        shuffle = self.config.actor_rollout_ref.actor.shuffle and not count_mode
         tu.assign_non_tensor(
             batch_td,
             calculate_entropy=calculate_entropy,
@@ -1245,10 +1276,19 @@ class RayPPOTrainer:
             seed=seed,
             dataloader_kwargs={"shuffle": shuffle},
             compute_loss=True,
+            monitor_batching=monitor_batching,
+            batching_requested_count=actor_config.train_num_minibatches if count_mode else 0,
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")
-        actor_output = rename_dict(actor_output, "actor/")
+        if monitor_batching:
+            updates = len(batch) // resolved_rows * ppo_epochs
+            self._batching_optimizer_steps = getattr(self, "_batching_optimizer_steps", 0) + updates
+            actor_output["batching/optimizer_steps"] = updates
+            actor_output["batching/optimizer_steps_since_start"] = self._batching_optimizer_steps
+        actor_output = {
+            key if key.startswith("batching/") else "actor/" + key: value for key, value in actor_output.items()
+        }
         # modify key name
         actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
         actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})

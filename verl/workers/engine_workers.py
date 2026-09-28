@@ -14,6 +14,7 @@
 import functools
 import logging
 import os
+import time
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -251,6 +252,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
         epochs = tu.pop(data, key="epochs", default=1)
         seed = tu.pop(data, key="seed", default=42)
         dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
+        monitor_batching = tu.pop(data, key="monitor_batching", default=False)
+        requested_count = tu.pop(data, key="batching_requested_count", default=0)
+        batching_minis, batching_denominators, batching_update_metrics = [], [], {}
 
         assert mini_batch_size is not None or num_mini_batch is not None
 
@@ -268,7 +272,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             data,
             mini_batch_size=mini_batch_size_per_gpu,
             epochs=epochs,
-            seed=seed + self.engine.get_data_parallel_rank(),
+            seed=seed + self.engine.get_data_parallel_rank() if seed is not None else None,
             dataloader_kwargs=dataloader_kwargs,
         )
 
@@ -281,6 +285,20 @@ class TrainingWorker(Worker, DistProfilerExtension):
             total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
+                if monitor_batching:
+                    from verl.utils.optimizer_batching import ROLE_NAMES
+
+                    local_rows = mini_batch_td.pop("batching_row_stats").cpu().tolist()
+                    local_rows = [r[:4] + [ROLE_NAMES[r[4]]] for r in local_rows]
+                    dp_group = self.engine.get_data_parallel_group()
+                    gathered = [None] * self.engine.get_data_parallel_size()
+                    if len(gathered) > 1:
+                        torch.distributed.all_gather_object(gathered, local_rows, group=dp_group)
+                    else:
+                        gathered = [local_rows]
+                    if sum(r[2] for rank in gathered for r in rank) <= 0:
+                        raise ValueError("All-masked optimizer minibatch; refusing an empty Adam update")
+                    batching_minis.append(gathered)
                 # add global token num
                 if "input_ids" in mini_batch_td:
                     global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
@@ -301,7 +319,22 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     update_lr_scheduler=batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
                 )
+                update_started = time.monotonic()
                 actor_output = self.train_batch(mini_batch_td)
+                if monitor_batching:
+                    # Engine supplies the actual DP-global token-mean denominator.
+                    batching_denominators.append(float(tu.get(mini_batch_td, "batch_num_tokens")))
+                    if self.engine.is_mp_src_rank_with_outputs():
+                        values = tu.get(actor_output, "metrics")
+                        k = total_num_iterations // epochs
+                        epoch, mini_idx = divmod(batch_idx, k)
+                        prefix = "batching/" + (f"epoch_{epoch}_" if epoch else "") + f"mini_{mini_idx}_"
+                        batching_update_metrics[prefix + "update_seconds"] = time.monotonic() - update_started
+                        if values.get("grad_norm") is not None:
+                            norm = float(values["grad_norm"])
+                            batching_update_metrics[prefix + "grad_norm_pre_clip"] = norm
+                            limit = self.optimizer_config.clip_grad
+                            batching_update_metrics[prefix + "grad_clipped"] = float(limit > 0 and norm > limit)
                 output_lst.append(actor_output)
 
             if self.engine.is_mp_src_rank_with_outputs():
@@ -317,6 +350,22 @@ class TrainingWorker(Worker, DistProfilerExtension):
                                 else list(chain.from_iterable(val))
                             )
                     append_to_dict(metrics, output)
+
+                if monitor_batching:
+                    from verl.utils.optimizer_batching import summarize_minibatches
+
+                    k = total_num_iterations // epochs
+                    for epoch in range(epochs):
+                        start, end = epoch * k, (epoch + 1) * k
+                        summary = summarize_minibatches(
+                            batching_minis[start:end], batching_denominators[start:end],
+                            self.engine.get_data_parallel_size(), requested_count,
+                        )
+                        if epoch:
+                            summary = {key.replace("batching/", f"batching/epoch_{epoch}_"): value
+                                       for key, value in summary.items()}
+                        metrics.update(summary)
+                    metrics.update(batching_update_metrics)
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:
